@@ -1,0 +1,23 @@
+# Build
+/target/
+/dist/
+**/*.rs.bk
+
+# Dados locais do banco (gerados em runtime)
+/data/
+/tmp/
+*.mdb
+*.mdb.next
+*.mdb.spill
+*.snapshot.next-*
+LOCK
+wal.log
+backup.jsonl
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / SO
+.DS_Store
+*.swp

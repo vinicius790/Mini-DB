@@ -1,0 +1,13 @@
+services:
+  minidb:
+    build: .
+    ports:
+      - "8080:8080"
+      - "7432:7432"
+    volumes:
+      - minidb-data:/data
+    environment:
+      MINIDB_PATH: /data
+      MINIDB_HTTP: 0.0.0.0:8080
+volumes:
+  minidb-data:

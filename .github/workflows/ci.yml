@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: cargo test --all-targets --locked
+      - run: cargo test --doc
+      - run: cargo build --bins --lib --locked
+
+  stress:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: cargo test --release --test model_based
+        env:
+          MINIDB_MODEL_STEPS: "20000"
+
+  contracts:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g typescript
+      - name: Contrato C (compila e executa contra a staticlib)
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsyntax-only -I include tests/ffi_header.c
+          cargo build --release --lib
+          cc -std=c11 -I include tests/ffi_header.c -L target/release -l:libmini_db.a -lpthread -ldl -lm -o ffi_test
+          mkdir -p tmp && cd tmp && ../ffi_test
+      - run: bash scripts/clients_smoke.sh
+      - run: bash scripts/demo_crash_recover.sh
+
+  fuzz:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: 30 s por alvo
+        working-directory: fuzz
+        run: |
+          for target in sql_parser json_parser wal_record page_decode rel_sql codec; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
+
+  coverage:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --all-targets --summary-only

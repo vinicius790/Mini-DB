@@ -1,0 +1,6 @@
+# Configuração padrão (pode copiar para o diretório de dados).
+path = "./data"
+pool_frames = 64
+tcp_addr = "127.0.0.1:7432"
+http_addr = "127.0.0.1:8080"
+fsync = true

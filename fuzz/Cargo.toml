@@ -1,0 +1,56 @@
+# Alvos de fuzzing (cargo-fuzz/libFuzzer). Crate separado: o núcleo continua
+# sem dependências. Uso: `cargo +nightly fuzz run sql_parser` (ver docs/QUALIDADE.md).
+[package]
+name = "minidb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+minidb = { path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "sql_parser"
+path = "fuzz_targets/sql_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_parser"
+path = "fuzz_targets/json_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_record"
+path = "fuzz_targets/wal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "page_decode"
+path = "fuzz_targets/page_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rel_sql"
+path = "fuzz_targets/rel_sql.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false

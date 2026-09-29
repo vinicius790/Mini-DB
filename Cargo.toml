@@ -1,0 +1,12 @@
+[package]
+name = "minidb"
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Motor KV didático sem dependências: B+ Tree, WAL, TTL, iteradores, SQL subset, HTTP, TCP e ABI C"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "mini_db"
+crate-type = ["rlib", "cdylib", "staticlib"]
