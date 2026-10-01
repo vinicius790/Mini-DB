@@ -3662,7 +3662,7 @@ impl<'a> Exec<'a> {
                         // A ordem do índice põe NULL primeiro em ASC e último em DESC.
                         Expr::Col(q, name)
                             if q.as_deref().is_none_or(|q| q == item.alias)
-                                && o.nulls_first.is_none_or(|first| first == !o.desc) =>
+                                && o.nulls_first.is_none_or(|first| first != o.desc) =>
                         {
                             t.column(name).ok().map(|c| (c, o.desc))
                         }
