@@ -3614,7 +3614,10 @@ impl<'a> Exec<'a> {
                 order_by
                     .iter()
                     .filter_map(|o| match &o.expr {
-                        Expr::Col(q, name) if q.as_deref().is_none_or(|q| q == item.alias) => {
+                        Expr::Col(q, name)
+                            if q.as_deref().is_none_or(|q| q == item.alias)
+                                && o.nulls_first.is_none_or(|first| first != o.desc) =>
+                        {
                             t.column(name).ok()
                         }
                         _ => None,
@@ -3829,8 +3832,15 @@ impl<'a> Exec<'a> {
                                 unreachable!("lookup só em tabela")
                             };
                             let v = self.eval(expr, &Ctx::new(&partial, &outer_row, outer))?;
+                            let ty = t.columns[*column].ty;
                             let mut found = Vec::new();
-                            if let Ok(v) = v.coerce(t.columns[*column].ty) {
+                            // `coluna_texto = número` compara como número (`'05' = 5`): lê tudo.
+                            if ty == Type::Text && v.as_f64().is_some() {
+                                self.fetch(t, &Access::Full, &mut |_, r| {
+                                    found.push((None, r));
+                                    Ok(true)
+                                })?;
+                            } else if let Ok(v) = v.coerce(ty) {
                                 if !v.is_null() {
                                     let access = if t.pk == [*column] {
                                         Access::Point(vec![v])
@@ -4367,7 +4377,8 @@ impl<'a> Exec<'a> {
                                 .iter()
                                 .filter_map(|o| match &o.expr {
                                     Expr::Col(q, name)
-                                        if q.as_deref().is_none_or(|q| q == item.alias) =>
+                                        if q.as_deref().is_none_or(|q| q == item.alias)
+                                            && o.nulls_first.is_none_or(|f| f != o.desc) =>
                                     {
                                         t.column(name).ok()
                                     }

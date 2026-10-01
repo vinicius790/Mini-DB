@@ -31,6 +31,11 @@ pub struct Regex {
 }
 
 const MAX_STEPS: usize = 2_000_000;
+// ponytail: teto fixo, estimado para 2 MiB de pilha em build de depuração; um grupo
+// repetido (`(ab)*`) casa por volta de 100 voltas. Subir só medindo a pilha no CI.
+/// Chamadas aninhadas de `Matcher::m`; acima disso a busca é abandonada, como em
+/// `MAX_STEPS` (a pilha nativa cresce a cada nível e estourá-la derruba o processo).
+const MAX_DEPTH: usize = 500;
 
 struct Parser<'a> {
     chars: Vec<char>,
@@ -273,11 +278,11 @@ fn is_word(c: char) -> bool {
 }
 
 struct Matcher<'r> {
-    text: Vec<char>,
+    text: &'r [char],
     ci: bool,
     steps: usize,
+    depth: usize,
     caps: Vec<Option<(usize, usize)>>,
-    _r: std::marker::PhantomData<&'r ()>,
 }
 
 impl Matcher<'_> {
@@ -302,10 +307,14 @@ impl Matcher<'_> {
         k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
     ) -> Option<usize> {
         self.steps += 1;
+        if self.depth >= MAX_DEPTH {
+            self.steps = MAX_STEPS + 1; // fundo demais: abandona a busca inteira
+        }
         if self.steps > MAX_STEPS {
             return None;
         }
-        match node {
+        self.depth += 1;
+        let r = match node {
             Node::Char(c) => {
                 if pos < self.text.len() && self.eq(self.text[pos], *c) {
                     k(self, pos + 1)
@@ -358,17 +367,84 @@ impl Matcher<'_> {
                 r
             }
             Node::Alt(alts) => {
+                let mut r = None;
                 for a in alts {
-                    if let Some(r) = self.m(a, pos, k) {
-                        return Some(r);
+                    r = self.m(a, pos, k);
+                    if r.is_some() {
+                        break;
                     }
                 }
-                None
+                r
             }
             Node::Seq(items) => self.seq(items, pos, k),
             Node::Repeat(inner, min, max, greedy) => {
-                self.repeat(inner, *min, *max, *greedy, pos, 0, k)
+                if matches!(**inner, Node::Char(_) | Node::Any | Node::Class(..)) {
+                    self.repeat_one(inner, *min, *max, *greedy, pos, k)
+                } else {
+                    self.repeat(inner, *min, *max, *greedy, pos, 0, k)
+                }
             }
+        };
+        self.depth -= 1;
+        r
+    }
+
+    /// `node` (`Char`, `Any` ou `Class`) casa o caractere em `pos`?
+    fn one(&self, node: &Node, pos: usize) -> bool {
+        let Some(&c) = self.text.get(pos) else {
+            return false;
+        };
+        match node {
+            Node::Char(x) => self.eq(c, *x),
+            Node::Any => c != '\n',
+            Node::Class(ranges, negated) => self.in_class(c, ranges) != *negated,
+            _ => false,
+        }
+    }
+
+    /// `repeat` para átomos de um caractere, em laço: `.*` e `\w+` não gastam pilha por
+    /// caractere. Mesma ordem de tentativas de `repeat`/`more`.
+    fn repeat_one(
+        &mut self,
+        inner: &Node,
+        min: usize,
+        max: Option<usize>,
+        greedy: bool,
+        pos: usize,
+        k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let limit = max.map_or(usize::MAX, |m| m.max(min));
+        let mut n = 0;
+        if greedy {
+            while n < limit && self.one(inner, pos + n) {
+                n += 1;
+            }
+            self.steps += n;
+            if n < min {
+                return None;
+            }
+            // Do mais longo para o mais curto.
+            loop {
+                if let Some(r) = k(self, pos + n) {
+                    return Some(r);
+                }
+                if n == min {
+                    return None;
+                }
+                n -= 1;
+            }
+        }
+        loop {
+            if n >= min {
+                if let Some(r) = k(self, pos + n) {
+                    return Some(r);
+                }
+            }
+            if n >= limit || !self.one(inner, pos + n) {
+                return None;
+            }
+            self.steps += 1;
+            n += 1;
         }
     }
 
@@ -464,21 +540,23 @@ impl Regex {
             return None;
         }
         let mut m = Matcher {
-            text: text.to_vec(),
+            text,
             ci: self.ci,
             steps: 0,
+            depth: 0,
             caps: vec![None; self.groups + 1],
-            _r: std::marker::PhantomData,
         };
         for s in start..=text.len() {
             m.steps = 0;
-            m.caps = vec![None; self.groups + 1];
-            if let Some(end) = m.m(&self.root, s, &mut |_, e| Some(e)) {
-                m.caps[0] = Some((s, end));
-                return Some((s, end, m.caps));
-            }
+            m.caps.fill(None);
+            let found = m.m(&self.root, s, &mut |_, e| Some(e));
+            // Busca cortada pelo limite: um `Some` aqui seria um casamento truncado.
             if m.steps > MAX_STEPS {
                 return None;
+            }
+            if let Some(end) = found {
+                m.caps[0] = Some((s, end));
+                return Some((s, end, m.caps));
             }
         }
         None

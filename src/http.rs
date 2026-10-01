@@ -95,10 +95,11 @@ pub fn serve_http_with(
         }
         let db = db.clone();
         let metrics = Arc::clone(&metrics);
-        let active = Arc::clone(&active);
+        // Criado aqui: se a thread não nascer, o guarda cai junto com o fechamento.
+        let connection = ConnectionGuard(Arc::clone(&active));
         let opts = Arc::clone(&opts);
         crate::server::spawn_connection(move || {
-            let _connection = ConnectionGuard(active);
+            let _connection = connection;
             metrics.inc_http();
             let mut tls_stream;
             let io: &mut dyn HttpIo = match &opts.tls {
@@ -307,6 +308,7 @@ fn handle(
         target,
         body,
         auth,
+        origin,
     } = match read_request(stream, opts.max_body_bytes) {
         Ok(request) => request,
         Err(error) => {
@@ -316,6 +318,16 @@ fn handle(
     };
     if method.is_empty() {
         return Ok(());
+    }
+    // Uma página web manda `Origin` em todo POST/PUT/DELETE, inclusive nos pedidos
+    // "simples" (formulário ou `fetch` sem preflight): só a origem liberada escreve.
+    if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        if let Some(origin) = origin.as_deref() {
+            let allowed = cors_origin();
+            if allowed != "*" && allowed != origin {
+                return Err(Error::Forbidden(format!("origem {origin} não liberada")));
+            }
+        }
     }
     let (path, query) = split_target(&target);
     let public = method == "OPTIONS" || matches!(path.as_str(), "/health" | "/v1/health");
@@ -894,6 +906,8 @@ struct Request {
     body: String,
     /// Cabeçalho `Authorization`, se houver.
     auth: Option<String>,
+    /// Cabeçalho `Origin`, se houver (requisição feita por uma página web).
+    origin: Option<String>,
 }
 
 /// Socket HTTP em claro (`TcpStream`) ou TLS.
@@ -938,6 +952,7 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
                     target: String::new(),
                     body: String::new(),
                     auth: None,
+                    origin: None,
                 });
             }
             return Err(Error::Other("requisição HTTP incompleta".into()));
@@ -977,6 +992,7 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
 
     let mut content_len = 0usize;
     let mut auth = None;
+    let mut origin = None;
     let mut has_content_len = false;
     let mut has_transfer_encoding = false;
     for line in lines {
@@ -1002,6 +1018,8 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
             }
         } else if name.eq_ignore_ascii_case("authorization") {
             auth = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("origin") {
+            origin = Some(value.trim().to_string());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             if has_transfer_encoding || has_content_len {
                 return Err(Error::Other("framing HTTP ambíguo".into()));
@@ -1031,6 +1049,7 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
         target,
         body,
         auth,
+        origin,
     })
 }
 
@@ -1069,19 +1088,25 @@ fn write_method_not_allowed(stream: &mut dyn HttpIo, allowed: &str) -> Result<()
     Ok(())
 }
 
-/// Cabeçalhos CORS (já com `\r\n` no fim). Por padrão não há nenhum: um site
-/// qualquer não pode ler nem escrever na API local pelo navegador. Para liberar
-/// uma origem (um painel web, por exemplo), defina `MINIDB_CORS_ORIGIN`.
-fn cors_headers() -> String {
+/// Origem liberada por `MINIDB_CORS_ORIGIN`, lida uma vez (vazia: nenhuma; `*`: todas).
+fn cors_origin() -> &'static str {
     static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VALUE
-        .get_or_init(|| match std::env::var("MINIDB_CORS_ORIGIN") {
-            Ok(origin) if !origin.is_empty() && !origin.contains(['\r', '\n']) => {
-                format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")
-            }
-            _ => String::new(),
-        })
-        .clone()
+    VALUE.get_or_init(|| match std::env::var("MINIDB_CORS_ORIGIN") {
+        Ok(origin) if !origin.contains(['\r', '\n']) => origin,
+        _ => String::new(),
+    })
+}
+
+/// Cabeçalhos CORS (já com `\r\n` no fim). Por padrão não há nenhum: o navegador
+/// não deixa um site qualquer ler as respostas nem mandar pedidos com preflight
+/// (`PUT`, `DELETE`, JSON). O `POST` "simples", que dispensa preflight, é recusado
+/// em `handle` pelo cabeçalho `Origin`. Para liberar uma origem (um painel web, por
+/// exemplo), defina `MINIDB_CORS_ORIGIN`.
+fn cors_headers() -> String {
+    match cors_origin() {
+        "" => String::new(),
+        origin => format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"),
+    }
 }
 
 fn write_preflight(stream: &mut dyn HttpIo, methods: &str) -> Result<()> {
@@ -1565,6 +1590,30 @@ mod tests {
         assert_eq!(active.load(Ordering::Relaxed), LIMIT);
         drop(super::ConnectionGuard(Arc::clone(&active)));
         assert_eq!(active.load(Ordering::Relaxed), LIMIT - 1);
+    }
+
+    #[test]
+    fn cross_origin_writes_are_refused() {
+        // Supõe `MINIDB_CORS_ORIGIN` ausente, como no CI.
+        let dir = std::env::temp_dir().join(format!("minidb-http-cors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = SharedDb::new(Db::open(&dir).unwrap());
+        let body = r#"{"key":"k","value":"v"}"#;
+        let post = format!(
+            "POST /v1/kv HTTP/1.1\r\nOrigin: http://x.test\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let refused = response_for(&db, post.as_bytes());
+        assert!(refused.starts_with("HTTP/1.1 403 "), "{refused}");
+        let read = response_for(
+            &db,
+            b"GET /v1/kv?key=k HTTP/1.1\r\nOrigin: http://x.test\r\n\r\n",
+        );
+        assert!(read.starts_with("HTTP/1.1 200 "), "{read}");
+        assert!(read.contains("\"value\":null"), "{read}");
+        db.write().unwrap().close().unwrap();
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -26,7 +26,7 @@ seguida de `Connection: close`.
 | `GET /v1/changes?since=LSN[&table=t][&limit=n][&timeout=s][&once=1]` | Stream de mudanças confirmadas (SSE `event: change`, `data: {lsn,table,kind,old,new}`); com `once=1` devolve JSON com o lote atual e `last_lsn`. `since` omitido = só o que vier. `410` quando o LSN saiu do anel. |
 | `GET /v1/listen?channel=a[&channel=b][&timeout=s]` | Notificações `NOTIFY` dos canais, em SSE (`event: notify`). |
 | `POST /v1/sql` | Executa SQL a partir de `{"sql":"...","params":[...]}`: um comando, ou um script (`a; b; c`) atômico, com `BEGIN ... COMMIT` opcional dentro do mesmo pedido. Scripts devolvem `{"ok":true,"results":[...]}`, um resultado por comando. |
-| `OPTIONS <rota>` | Resposta preflight CORS `204` apenas para rotas conhecidas; `Allow`/`Access-Control-Allow-Methods` é específico da rota e o header permitido é `Content-Type`. |
+| `OPTIONS <rota>` | Resposta preflight CORS `204` apenas para rotas conhecidas; `Allow`/`Access-Control-Allow-Methods` é específico da rota e os headers permitidos são `Content-Type` e `Authorization`. Sem `MINIDB_CORS_ORIGIN` a resposta não traz `Access-Control-Allow-Origin`. |
 
 ## Dados e respostas
 
@@ -117,11 +117,21 @@ responde `400`; para transações longas use a conexão TCP. Rotas de replicaç�
 `GET /v1/replication` (papel, época, LSNs, réplicas conectadas, modo síncrono) e
 `POST /v1/replication/promote`; manutenção: `POST /v1/maintain`.
 
-Por padrão **não há cabeçalhos CORS**: uma página web qualquer não consegue ler nem
-escrever na API pelo navegador (com `Access-Control-Allow-Origin: *`, qualquer site
-visitado poderia atacar um servidor em `127.0.0.1` sem token). Para um painel web
-legítimo, defina `MINIDB_CORS_ORIGIN=https://origem.exemplo` (uma só origem): as
-respostas passam a incluir `Access-Control-Allow-Origin` e `Vary: Origin`. Preflight
+Por padrão **não há cabeçalhos CORS**: o navegador não deixa uma página web qualquer
+ler as respostas nem enviar pedidos que exigem preflight (`PUT`, `DELETE`,
+`Content-Type: application/json`). Os pedidos "simples", que dispensam preflight (um
+formulário ou `fetch` com `mode: 'no-cors'` fazendo `POST`), são barrados pelo próprio
+servidor: todo pedido que não seja `GET`, `HEAD` ou `OPTIONS` e traga um cabeçalho
+`Origin` diferente da origem liberada recebe `403` e não é executado. Pedidos sem
+`Origin` (curl, clientes não-browser) não mudam; um `GET` de outra origem é executado,
+mas a página não lê a resposta. Para um painel web legítimo, defina
+`MINIDB_CORS_ORIGIN=https://origem.exemplo` (uma só origem, comparada exatamente com o
+`Origin`; lida uma vez por processo): as respostas passam a incluir
+`Access-Control-Allow-Origin` e `Vary: Origin`, e essa origem pode escrever. Isso vale
+também para um painel servido no mesmo endereço da API por um proxy, porque o navegador
+manda `Origin` em todo `POST`/`PUT`/`DELETE`. `MINIDB_CORS_ORIGIN=*` libera qualquer
+origem (qualquer site visitado poderia então atacar um servidor em `127.0.0.1` sem
+token). Preflight
 `OPTIONS` em rota conhecida retorna 204 e anuncia os métodos aceitos naquela rota, além
 de autorizar `Content-Type` e `Authorization`. Preflight para rota inexistente retorna
 404. Não há suporte a credentials. CORS não é autenticação e não impede acesso por
@@ -130,7 +140,8 @@ local, então defina `token` ou crie usuários.
 
 Status usados: `200` para operações concluídas, `400` também para erros de
 validação vindos do motor (ex.: restrição violada), `401` sem token válido, `403`
-para escrita em réplica somente leitura, `409` para conflito de transação, `204` para
+para escrita em réplica somente leitura, privilégio ausente ou `Origin` não liberada,
+`409` para conflito de transação, `204` para
 preflight, `400` para
 requisição inválida (incluindo SQL inválido e chave/valor fora do limite), `404` para
 rota não reconhecida, `405` para método não suportado numa rota conhecida (`Allow`

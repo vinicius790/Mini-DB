@@ -71,10 +71,11 @@ pub fn serve_with(db: SharedDb, addr: &str, opts: NetOptions) -> Result<()> {
             continue;
         }
         let db = db.clone();
-        let active = Arc::clone(&active);
+        // Criado aqui: se a thread não nascer, o guarda cai junto com o fechamento.
+        let connection = ConnectionGuard(Arc::clone(&active));
         let opts = Arc::clone(&opts);
         spawn_connection(move || {
-            let _connection = ConnectionGuard(active);
+            let _connection = connection;
             if let Err(e) = handle_client(&db, stream, &opts) {
                 eprintln!("client: {e}");
             }
@@ -88,6 +89,19 @@ pub(crate) fn spawn_connection(f: impl FnOnce() + Send + 'static) {
     if let Err(e) = std::thread::Builder::new().stack_size(64 << 20).spawn(f) {
         eprintln!("falha ao criar thread de conexão: {e}");
     }
+}
+
+/// Linha de requisição HTTP (`MÉTODO alvo HTTP/1.x`, três palavras), como a que um
+/// navegador manda ao abrir esta porta. Um comando com mais palavras não é uma.
+fn is_http_request_line(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let method = words.next().unwrap_or_default();
+    let version = words.nth(1).unwrap_or_default();
+    let known_method = matches!(
+        method,
+        "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH"
+    );
+    known_method && words.next().is_none() && matches!(version, "HTTP/1.1" | "HTTP/1.0")
 }
 
 fn handle_client(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
@@ -113,7 +127,7 @@ fn handle_client(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<
         }
         // Um navegador (página qualquer) pode abrir esta porta e mandar um POST:
         // a linha de requisição HTTP encerra a conexão antes do corpo.
-        if cmd_line.ends_with(" HTTP/1.1") || cmd_line.ends_with(" HTTP/1.0") {
+        if is_http_request_line(cmd_line) {
             writeln!(writer, "ERR protocolo HTTP não é suportado nesta porta")?;
             break;
         }
@@ -121,9 +135,19 @@ fn handle_client(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<
             writeln!(writer, "OK bye")?;
             break;
         }
-        if open_mode && session.auth_required()? {
-            open_mode = false;
-            authenticated = false;
+        if open_mode {
+            match session.auth_required() {
+                Ok(true) => {
+                    open_mode = false;
+                    authenticated = false;
+                }
+                Ok(false) => {}
+                // Falha passageira (réplica ressincronizando): responde e mantém a conexão.
+                Err(e) => {
+                    writeln!(writer, "ERR {e}")?;
+                    continue;
+                }
+            }
         }
         if !authenticated {
             let credentials = cmd_line
@@ -188,8 +212,18 @@ fn handle_client(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{read_command_line, CommandLine, MAX_COMMAND_BYTES};
+    use super::{is_http_request_line, read_command_line, CommandLine, MAX_COMMAND_BYTES};
     use std::io::Cursor;
+
+    #[test]
+    fn only_a_real_http_request_line_is_refused() {
+        assert!(is_http_request_line("POST /v1/sql HTTP/1.1"));
+        assert!(is_http_request_line("GET / HTTP/1.0"));
+        // Comandos válidos cujo valor termina em ` HTTP/1.1` seguem valendo.
+        assert!(!is_http_request_line("PUT req:1 GET /index.html HTTP/1.1"));
+        assert!(!is_http_request_line("SET k HTTP/1.1"));
+        assert!(!is_http_request_line("GET key"));
+    }
 
     #[test]
     fn command_line_limit_is_enforced_while_reading() {

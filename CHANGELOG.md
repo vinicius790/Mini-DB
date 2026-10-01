@@ -15,8 +15,32 @@ Segurança
   recusada com `tls_client_auth = required`.
 - `tls.key` autogerado com 0600; `random_bytes` usa `BCryptGenRandom` no Windows;
   redução módulo L do Ed25519 sem desvios dependentes de segredo.
+- HTTP recusa (`403`) `POST`/`PUT`/`DELETE` com `Origin` diferente da origem liberada:
+  uma página qualquer não escreve mais na API local por `POST` sem preflight.
+- Autorização: subconsulta em `LIMIT`/`OFFSET` é conferida; `RETURNING` exige `SELECT`
+  na tabela; `ALL` dividido entre concessão direta e papel é somado.
+- PostgreSQL: mensagens antes da autenticação limitadas a 64 KiB; conexão aberta sem
+  usuários é encerrada quando o primeiro usuário é criado; erro de TLS aborta a subida
+  em vez de cair para texto claro.
+- Regex: profundidade da busca limitada (grupo repetido muitas vezes dá "não casa" em
+  vez de estourar a pilha); `.*` e `\w+` não gastam pilha por caractere.
+- Criptografia em repouso: estado de conversão incompleto não apaga mais a chave; a
+  chave nova é gravada com `fsync`. Chave privada TLS recebe 0600 antes da escrita.
 
 Correções
+- Transação que apaga o pai que ela mesma referenciou não dá mais conflito falso de
+  chave estrangeira; `TRUNCATE` do pai em transação protege contra filha concorrente.
+- WAL: CRC ruim seguido só de zeros é cauda de escrita interrompida (queda de energia),
+  não corrupção; `restore --until-lsn` não avisa de lacuna depois do alvo.
+- `EXPLAIN` mostra o `SORT` de `ORDER BY ... NULLS`; join por índice com coluna de
+  texto e valor numérico (`'05' = 5`) não perde linhas; `EXPLAIN EXPLAIN ...` entra no
+  limite de aninhamento; `sum() FILTER (...)` sem argumento é erro.
+- Datas: modificadores e `date_diff` fora do intervalo dão erro em vez de estouro;
+  `printf('%05d', -42)` devolve `-0042`.
+- Configuração: comentário depois de valor entre aspas é ignorado; booleano
+  desconhecido mantém o padrão em vez de desligar `tls`/`fsync`.
+- Servidores: vaga de conexão devolvida quando a thread não nasce; consulta vazia no
+  protocolo PostgreSQL entrega as notificações; `minidb-inspect` nunca faz checkpoint.
 - `DEFAULT 1e999` (infinito) corrompia o catálogo: o lexer recusa números fora do
   intervalo e o JSON escreve `null` para não finitos.
 - Regex `[[:]` causava panic; texto/aninhamento limitados; um panic em escrita não

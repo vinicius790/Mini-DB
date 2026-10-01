@@ -93,14 +93,17 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
   use em produção.
 - O padrão é loopback (`127.0.0.1`); `0.0.0.0` expõe a porta na rede. Não faça isso sem
   um proxy/firewall que autentique, limite taxa e aplique timeouts.
-- HTTP não envia cabeçalhos CORS por padrão (um site visitado no navegador não lê nem
-  escreve na API local). `MINIDB_CORS_ORIGIN` libera uma única origem. CORS não impede
-  clientes diretos e não autentica: **sem `token` nem usuários o banco está em modo
-  aberto**, e qualquer processo local acessa a API; um ataque de DNS rebinding
-  contra o modo aberto não é barrado (não há checagem de `Host`). Defina token ou
-  usuários sempre que o bind não for estritamente local. O TCP de linhas encerra a
-  conexão ao receber uma linha de requisição HTTP (um navegador não consegue usá-lo
-  como transporte de comandos).
+- HTTP não envia cabeçalhos CORS por padrão: o navegador não deixa um site visitado ler
+  as respostas da API local nem enviar pedidos com preflight. Pedidos que não sejam
+  `GET`/`HEAD`/`OPTIONS` e tragam um cabeçalho `Origin` diferente da origem liberada
+  recebem `403`, o que barra também o `POST` "simples" (formulário, `fetch` sem
+  preflight). `MINIDB_CORS_ORIGIN` libera uma única origem (`*` libera todas). Isso não
+  impede clientes diretos (sem `Origin`) e não autentica: **sem `token` nem usuários o
+  banco está em modo aberto**, e qualquer processo local acessa a API; um ataque de
+  DNS rebinding contra o modo aberto ainda lê por `GET` (não há checagem de `Host`).
+  Defina token ou usuários sempre que o bind não for estritamente local. O TCP de
+  linhas encerra a conexão ao receber uma linha de requisição HTTP (`MÉTODO alvo
+  HTTP/1.x`; um navegador não consegue usá-lo como transporte de comandos).
 - HTTP limita cabeçalho a 32 KiB, corpo a `max_body_bytes` (padrão: o suficiente para
   um valor máximo em hexadecimal) e cada leitura bloqueante a 30 s; TCP limita linhas
   ao tamanho de um valor máximo e usa timeout de leitura de 300 s. São timeouts de leitura

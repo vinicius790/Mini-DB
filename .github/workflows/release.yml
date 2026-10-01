@@ -51,6 +51,8 @@ jobs:
             minidb-*.zip
 
   docker:
+    # Só publica a imagem depois que os testes (job `binaries`) passarem.
+    needs: binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

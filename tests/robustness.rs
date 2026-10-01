@@ -139,6 +139,12 @@ fn regex_compiler_and_matcher_never_panic() {
     assert!(Regex::new("[[:]", "").is_err());
     assert!(Regex::new("[[:alpha:]]+", "").unwrap().is_match("abc"));
     assert!(!Regex::new("^[[:digit:]]+$", "").unwrap().is_match("abc"));
+    // Texto no tamanho máximo: `.*` não pode gastar pilha por caractere, e um grupo
+    // repetido tem de desistir (profundidade limitada) em vez de estourar a pilha.
+    let long = "a".repeat(50_000);
+    assert!(Regex::new("^.*$", "").unwrap().is_match(&long));
+    let _ = Regex::new("(a)*$", "").unwrap().is_match(&long);
+    let _ = Regex::new("^((a|b))+c", "").unwrap().is_match(&long);
 }
 
 #[test]

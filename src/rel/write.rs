@@ -127,6 +127,9 @@ pub(super) fn plan_into(exec: &Exec<'_>, stmt: &Stmt, pending: &Pending) -> Resu
                 if child.name == t.name {
                     continue;
                 }
+                // Numa transação, nenhuma filha pode aparecer até o commit.
+                let rows = child.row_prefix();
+                src.guard_unchanged(&rows, &prefix_successor(&rows).expect("prefixo"));
                 let mut any = false;
                 fetch_from(src, child, &Access::Full, &mut |_, _| {
                     any = true;

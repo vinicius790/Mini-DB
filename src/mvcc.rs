@@ -805,6 +805,12 @@ impl Txn {
                 // existir agora (estado confirmado + escritas desta transação).
                 // Atualizar outras colunas do pai não é conflito; apagá-lo é.
                 for (start, end) in &reads.guard_present {
+                    // Pai gravado ou apagado pela própria transação: o comando que o
+                    // alterou já tratou as filhas, e outra transação mexer nele vira
+                    // conflito de escrita logo abaixo.
+                    if start < end && writes.range(start.clone()..end.clone()).next().is_some() {
+                        continue;
+                    }
                     let mut present = false;
                     let current = crate::rel::Overlay {
                         base: db,

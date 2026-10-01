@@ -10,9 +10,9 @@ COPY --from=build /src/target/release/minidb-bench /usr/local/bin/minidb-bench
 COPY --from=build /src/target/release/minidb-verify /usr/local/bin/minidb-verify
 COPY --from=build /src/target/release/minidb-inspect /usr/local/bin/minidb-inspect
 USER minidb
-# 8080 = HTTP/JSON. O protocolo PostgreSQL (5432) e o TCP de linhas (7432) ficam
-# em 127.0.0.1 dentro do contêiner; para publicá-los, defina MINIDB_PG/MINIDB_TCP
-# com 0.0.0.0 e MINIDB_TOKEN (ou crie usuários) antes de expor as portas.
+# 8080 = HTTP/JSON. O protocolo PostgreSQL (5432) fica em 127.0.0.1 dentro do contêiner;
+# para publicá-lo, defina MINIDB_PG=0.0.0.0:5432 e MINIDB_TOKEN (ou crie usuários).
+# O TCP de linhas (7432) não sobe com `http`: use `docker run ... serve /data 0.0.0.0:7432`.
 EXPOSE 8080
 VOLUME ["/data"]
 ENV MINIDB_PATH=/data

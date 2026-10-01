@@ -1104,7 +1104,10 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
                 "week" => 7 * 86400,
                 other => return Err(Error::Sql(format!("unidade desconhecida {other}"))),
             };
-            Value::Int((x - y) / div)
+            let Some(diff) = x.checked_sub(y) else {
+                return Err(Error::Sql("estouro".into()));
+            };
+            Value::Int(diff / div)
         }
         // --- JSON ---
         "json_extract" | "json_value" | "json_query" => {
@@ -1238,7 +1241,13 @@ fn printf(fmt: &str, args: &[Value]) -> Result<String> {
         if left {
             out.push_str(&format!("{body:<width$}"));
         } else if spec.starts_with('0') && conv != 's' {
-            out.push_str(&format!("{body:0>width$}"));
+            // O sinal fica antes dos zeros: `%05d` de -42 é `-0042`.
+            let (sign, digits) = match body.strip_prefix('-') {
+                Some(rest) => ("-", rest),
+                None => ("", body.as_str()),
+            };
+            let pad = width.saturating_sub(sign.len());
+            out.push_str(&format!("{sign}{digits:0>pad$}"));
         } else {
             out.push_str(&format!("{body:>width$}"));
         }
@@ -1416,6 +1425,11 @@ fn parse_datetime_text(s: &str) -> Option<i64> {
 fn apply_modifier(secs: i64, m: &str) -> Result<i64> {
     let m = m.trim().to_ascii_lowercase();
     let bad = || Error::Sql(format!("modificador de data desconhecido: {m}"));
+    // Fora desta faixa (~±31 milhões de anos) as contas abaixo podem estourar o i64.
+    let overflow = || Error::Sql("data/hora fora do intervalo".into());
+    if secs.unsigned_abs() > 1_000_000_000_000_000 {
+        return Err(overflow());
+    }
     if let Some(rest) = m.strip_prefix("start of ") {
         let c = civil(secs);
         return Ok(match rest.trim() {
@@ -1439,6 +1453,9 @@ fn apply_modifier(secs: i64, m: &str) -> Result<i64> {
     }
     let (amount, unit) = m.split_once(' ').ok_or_else(bad)?;
     let amount: f64 = amount.trim().parse().map_err(|_| bad())?;
+    if !amount.is_finite() || amount.abs() > 1e11 {
+        return Err(overflow());
+    }
     let unit = unit.trim().trim_end_matches('s');
     Ok(match unit {
         "second" | "sec" => secs + amount.round() as i64,
@@ -1634,6 +1651,11 @@ mod tests {
             fmt_datetime(apply_modifier(secs, "start of year").unwrap(), true),
             "2024-01-01 00:00:00"
         );
+        // Estouro vira erro, não pânico.
+        assert!(apply_modifier(secs, "+1e300 days").is_err());
+        assert!(apply_modifier(i64::MAX, "+1 second").is_err());
+        let far = vec![Value::Int(i64::MAX), Value::Int(-1)];
+        assert!(call("date_diff", far).is_err());
         assert_eq!(strftime("%Y/%j %w", secs).unwrap(), "2024/031 3");
         for (y, m, d) in [(2000, 2, 29), (1600, 12, 31), (-44, 3, 15), (9999, 1, 1)] {
             assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
@@ -1664,6 +1686,7 @@ mod tests {
             ),
             t("001.2|ab |ff")
         );
+        assert_eq!(c("printf", vec![t("%05d"), Value::Int(-42)]), t("-0042"));
         assert_eq!(
             c(
                 "json_extract",

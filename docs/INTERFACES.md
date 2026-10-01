@@ -211,8 +211,10 @@ cliente, erro HTTP gera uma exceção com status e mensagem do serviço. Os clie
 exemplos síncronos/pequenos, não SDKs com retries, autenticação ou controle de taxa.
 
 No browser, o cliente TypeScript envia `Content-Type: application/json`, o que causa
-preflight CORS. O servidor permite qualquer origem; isso não concede acesso nem fornece
-proteção. Para detalhes dos campos, status e comportamento do scan, veja [HTTP.md](HTTP.md).
+preflight CORS. Por padrão o servidor não envia cabeçalhos CORS e recusa (`403`)
+escritas com `Origin` não liberado, então o navegador bloqueia o cliente; libere a
+origem do painel com `MINIDB_CORS_ORIGIN`. CORS não autentica nem substitui token ou
+usuários. Para detalhes dos campos, status e comportamento do scan, veja [HTTP.md](HTTP.md).
 
 ## ABI C
 

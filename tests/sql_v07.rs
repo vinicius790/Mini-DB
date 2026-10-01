@@ -790,6 +790,14 @@ fn snapshot_transactions_cannot_break_unique_or_foreign_keys() {
     db.sql("UPDATE p SET nome = 'novo' WHERE id = 3").unwrap();
     a.execute("COMMIT").unwrap();
 
+    // Apagar na mesma transação o pai que ela própria referenciou não é conflito.
+    db.sql("INSERT INTO p (id) VALUES (4)").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("INSERT INTO c VALUES ('y', 4)").unwrap();
+    a.execute("DELETE FROM c WHERE id = 'y'").unwrap();
+    a.execute("DELETE FROM p WHERE id = 4").unwrap();
+    a.execute("COMMIT").unwrap();
+
     assert_eq!(
         rows_of(db.sql("SELECT id FROM c ORDER BY id").unwrap(), "c"),
         ["w", "z"]

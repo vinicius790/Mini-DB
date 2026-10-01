@@ -6,8 +6,15 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# Espelha o .gitignore: nada de dados de runtime nem de chaves privadas no pacote.
 EXCLUDE_DIRS = {".git", "target", "dist", "data", "__pycache__", "corpus", "artifacts"}
-EXCLUDE_SUFFIXES = {".pyc", ".mdb", ".spill", ".next"}
+EXCLUDE_DIRS |= {"wal-archive", ".vscode"}
+EXCLUDE_SUFFIXES = {".pyc", ".mdb", ".spill", ".next", ".swp", ".bk"}
+EXCLUDE_NAMES = {"LOCK", "wal.log", "backup.jsonl", ".DS_Store"}
+# Só na raiz, como no .gitignore: os certificados de teste ficam em tests/fixtures/pki.
+EXCLUDE_ROOT = {"tmp", "pki", "tls.key", "tls.crt"}
+# `x.mdb.key`, `x.mdb.journal`, `x.mdb.convert.state`, `x.snapshot.next-1`...
+EXCLUDE_INFIXES = (".mdb.", ".snapshot.next-")
 
 
 def cargo(*args: str) -> None:
@@ -24,8 +31,10 @@ def package() -> Path:
                 not path.is_file()
                 or path.is_symlink()
                 or any(part in EXCLUDE_DIRS for part in parts)
+                or parts[0] in EXCLUDE_ROOT
                 or path.suffix in EXCLUDE_SUFFIXES
-                or path.name in {"LOCK", "wal.log"}
+                or path.name in EXCLUDE_NAMES
+                or any(infix in path.name for infix in EXCLUDE_INFIXES)
             ):
                 continue
             out.write(path, Path(ROOT.name) / path.relative_to(ROOT))

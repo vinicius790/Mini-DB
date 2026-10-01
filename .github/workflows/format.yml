@@ -1,8 +1,9 @@
 # Formata o código com `cargo fmt` e grava o resultado num commit. Roda só quando
 # acionado à mão (aba Actions → format → Run workflow): útil para quem não tem o
 # Rust instalado e viu o passo `cargo fmt --check` do CI falhar.
-# Commits feitos por este workflow não disparam o CI sozinhos: rode o CI de novo
-# (Re-run jobs) ou envie o próximo commit.
+# Commits feitos por este workflow usam o GITHUB_TOKEN e não disparam o CI, e
+# "Re-run jobs" repete o commit antigo (falha de novo): o CI só roda no próximo push
+# (um commit vazio serve: git commit --allow-empty -m "ci" && git push).
 name: format
 
 on:
