@@ -1215,7 +1215,9 @@ fn printf(fmt: &str, args: &[Value]) -> Result<String> {
             None => (spec.parse().unwrap_or(0), None),
         };
         if width > 1 << 20 || prec.is_some_and(|p| p > 1 << 20) {
-            return Err(Error::Sql("printf: largura ou precisão grande demais".into()));
+            return Err(Error::Sql(
+                "printf: largura ou precisão grande demais".into(),
+            ));
         }
         let arg = next.next().unwrap_or(&Value::Null);
         let body = match conv {

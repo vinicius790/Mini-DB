@@ -16,8 +16,10 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
     p
 }
 
-const SHORT: Duration = Duration::from_millis(40);
-const WAIT: Duration = Duration::from_millis(120);
+// Folga generosa: em máquinas lentas (fsync no Windows) uma escrita passa de 40 ms,
+// e a chave expirava antes da primeira conferência.
+const SHORT: Duration = Duration::from_secs(1);
+const WAIT: Duration = Duration::from_secs(2);
 const LONG: Duration = Duration::from_secs(3600);
 
 #[test]
