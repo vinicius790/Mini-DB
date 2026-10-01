@@ -1,8 +1,9 @@
 use mini_db::db::Db;
-#[test]
+
 /// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
 static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[test]
 fn cursor_does_not_repeat_boundary() {
     let path = std::env::temp_dir().join(format!(
         "minidb-page-{}-{}-{}",
