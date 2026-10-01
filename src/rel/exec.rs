@@ -4520,10 +4520,17 @@ pub(super) fn conjuncts(e: &Expr, out: &mut Vec<Expr>) {
 }
 
 fn hash_key(v: &Value) -> Vec<u8> {
-    // Inteiros e reais iguais precisam cair no mesmo balde (1 = 1.0).
-    match v {
-        Value::Int(n) => key_of(&Value::Real(*n as f64)),
-        other => key_of(other),
+    // Valores iguais para o `=` precisam cair no mesmo balde: 1 = 1.0, 0.0 = -0.0 e,
+    // como texto numérico compara com número, '05' = 5. O balde pode juntar a mais
+    // ('05' e '5'): o ON é reavaliado em cada candidata.
+    let number: Option<f64> = match v {
+        Value::Text(s) => s.trim().parse().ok(),
+        other => other.as_f64(),
+    };
+    match number {
+        Some(x) if x == 0.0 => key_of(&Value::Real(0.0)),
+        Some(x) => key_of(&Value::Real(x)),
+        None => key_of(v),
     }
 }
 

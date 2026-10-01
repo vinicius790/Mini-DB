@@ -211,16 +211,24 @@ pub fn recover_convert(dir: &Path) -> Result<()> {
 /// claro) e `to` a nova (`None` = remover a cifra). Faz checkpoint (WAL vazio),
 /// reescreve `data.mdb` página a página e troca `data.mdb.key`. O arquivo de
 /// WAL arquivado (`wal-archive/`) é descartado: continha frames na cifra antiga.
+///
+/// O lock do diretório (o mesmo de [`crate::Db::open`]) fica preso do início ao
+/// fim: com o banco aberto por outro handle ou processo a conversão falha sem
+/// tocar em nada, e ninguém abre o banco enquanto ela roda.
 pub fn convert(dir: &Path, from: Option<&str>, to: Option<&str>) -> Result<String> {
     use crate::buffer::BufferPool;
     use crate::page::PAGE_SIZE;
     use std::io::Write;
-    {
+    // Solto só no retorno (sucesso ou erro). Sem ele, um `Db::open` concorrente rodaria
+    // `recover_convert`, tomaria a conversão em andamento por interrompida e a desfaria.
+    let _lock = {
         // Checkpoint com WAL truncado: tudo fica em data.mdb.
         let mut db = crate::Db::open_encrypted(dir, 64, true, from)?;
         db.set_wal_retention(0);
+        let lock = db.take_lock();
         db.close()?;
-    }
+        lock
+    };
     let data = crate::Db::data_path(dir);
     let old = open_key(dir, from, true)?.map(std::sync::Arc::new);
     let key = keyfile_path(dir);

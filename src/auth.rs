@@ -13,6 +13,7 @@ use crate::json::Json;
 use crate::rel::parser::{Expr, InsertSource, OnConflict, Query, SetExpr, Source, Stmt};
 use crate::rel::{expr_children, Source as Catalog};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 pub const USER_PREFIX: &[u8] = &[0xFF, b'u'];
 /// Iterações do PBKDF2 (o padrão do PostgreSQL).
@@ -639,6 +640,28 @@ pub(crate) fn authorize_object(
 // SCRAM-SHA-256 do lado do servidor (protocolo PostgreSQL)
 // ---------------------------------------------------------------------------
 
+/// Segredo do processo, criado uma única vez, de onde saem as credenciais fictícias.
+fn mock_secret() -> &'static [u8; 32] {
+    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    SECRET.get_or_init(crypto::random_bytes::<32>)
+}
+
+/// Credenciais fictícias de um nome sem login: mesmo formato das reais (sal de
+/// 16 bytes, `SCRAM_ITERATIONS`) e estáveis por nome dentro do processo. Saem
+/// de um HMAC com chave secreta, e não de algo público, para que o cliente não
+/// consiga recalcular o sal e, pela diferença, descobrir quem existe.
+fn mock_scram(user: &str) -> Scram {
+    // ponytail: o segredo é por processo, então o sal fictício muda a cada
+    // reinício (o de um usuário real não); persistir no catálogo se isso importar.
+    let part = |label: &[u8]| hmac_sha256(mock_secret(), &[label, user.as_bytes()]);
+    Scram {
+        salt: part(b"salt")[..16].to_vec(),
+        iterations: SCRAM_ITERATIONS,
+        stored_key: part(b"stored"),
+        server_key: part(b"server"),
+    }
+}
+
 /// Estado de uma negociação SCRAM. Usuário inexistente recebe credenciais
 /// fictícias e falha na prova, sem revelar que não existe.
 pub struct ScramServer {
@@ -666,14 +689,11 @@ impl ScramServer {
             }
         }
         let client_nonce = nonce.ok_or_else(bad)?;
+        // Calculadas sempre (e sem PBKDF2): quem existe e quem não existe custam o mesmo.
+        let mock = mock_scram(user);
         let (scram, valid_user) = match principal.and_then(|p| p.scram.clone()) {
             Some(s) if principal.is_some_and(|p| p.login) => (s, true),
-            // Sal fictício estável por nome: repetir a tentativa não revela quem existe.
-            _ => {
-                let seed = [b"minidb-mock-salt".as_slice(), user.as_bytes()].concat();
-                let salt = sha256(&seed)[..16].to_vec();
-                (Scram::derive("", salt, SCRAM_ITERATIONS), false)
-            }
+            _ => (mock, false),
         };
         let server_nonce = format!(
             "{client_nonce}{}",
@@ -783,6 +803,51 @@ mod tests {
             .is_err());
         let (ghost, _) = ScramServer::start(None, "ghost", &client_first).unwrap();
         assert!(ghost.finish(&client_final).is_err());
+    }
+
+    /// Sal (já decodificado) que o servidor anuncia para `user` no `server-first`.
+    fn announced_salt(principal: Option<&Principal>, user: &str) -> Vec<u8> {
+        let first = format!("n,,n={user},r=abc");
+        let (_, server_first) = ScramServer::start(principal, user, &first).unwrap();
+        let attrs: Vec<&str> = server_first.split(',').collect();
+        assert_eq!(attrs[2], format!("i={SCRAM_ITERATIONS}"));
+        crypto::base64_decode(attrs[1].strip_prefix("s=").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn scram_mock_salt_does_not_reveal_who_exists() {
+        let ghost = announced_salt(None, "ghost");
+        assert_eq!(ghost.len(), 16);
+        // Estável por nome dentro do processo e distinto entre nomes.
+        assert_eq!(ghost, announced_salt(None, "ghost"));
+        assert_ne!(ghost, announced_salt(None, "fantasma"));
+        // Não é mais a derivação pública antiga: sha256(constante || nome).
+        let old = sha256(b"minidb-mock-saltghost");
+        assert_ne!(ghost, old[..16].to_vec());
+        // Papel sem login é tratado como nome inexistente.
+        let role = Principal::role("ghost");
+        assert_eq!(ghost, announced_salt(Some(&role), "ghost"));
+        // Usuário real continua anunciando o próprio sal.
+        let ana = Principal::user("ana", "segredo", false);
+        let salt = ana.scram.clone().unwrap().salt;
+        assert_eq!(announced_salt(Some(&ana), "ana"), salt);
+    }
+
+    #[test]
+    fn scram_unknown_user_always_fails() {
+        // Cliente honesto com a senha vazia, a que a derivação antiga usava.
+        let first = "n,,n=ghost,r=abc";
+        let (server, server_first) = ScramServer::start(None, "ghost", first).unwrap();
+        let attrs: Vec<&str> = server_first.split(',').collect();
+        let salt = crypto::base64_decode(attrs[1].strip_prefix("s=").unwrap()).unwrap();
+        let salted = crypto::pbkdf2_sha256(b"", &salt, SCRAM_ITERATIONS);
+        let client_key = hmac_sha256(&salted, &[b"Client Key"]);
+        let without_proof = format!("c=biws,{}", attrs[0]);
+        let auth = format!("n=ghost,r=abc,{server_first},{without_proof}");
+        let sig = hmac_sha256(&sha256(&client_key), &[auth.as_bytes()]);
+        let proof: Vec<u8> = client_key.iter().zip(sig).map(|(a, b)| a ^ b).collect();
+        let client_final = format!("{without_proof},p={}", crypto::base64_encode(&proof));
+        assert!(server.finish(&client_final).is_err());
     }
 
     #[test]

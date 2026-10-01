@@ -323,7 +323,7 @@ impl Db {
             .truncate(false)
             .open(dir.join("LOCK"))?;
         lock.try_lock()
-            .map_err(|e| Error::Other(format!("database lock {}: {e}", dir.display())))?;
+            .map_err(|e| Error::Other(format!("banco {} já está em uso: {e}", dir.display())))?;
         // Sobra de um VACUUM interrompido antes do rename: o original vale.
         for leftover in ["", ".spill", ".journal"] {
             let _ = fs::remove_file(dir.join(format!("{VACUUM_FILE}{leftover}")));
@@ -433,12 +433,17 @@ impl Db {
         for rec in records.iter().filter(|r| r.lsn() > ckpt) {
             match rec {
                 WalRecord::Begin { txn_id, lsn } => {
-                    // `Begin` sem `Commit`/`Abort` antes (o `Abort` não chegou ao
-                    // disco): a transação anterior nunca confirmou e é descartada.
-                    let _ = lsn;
+                    // `Begin` com outra transação aberta só é aceito logo depois do
+                    // `Begin` dela: a primeira operação do frame não coube no disco, o
+                    // `Abort` também não, e o handle seguiu escrevendo (versões antigas;
+                    // hoje o WAL recusa escritas até a reabertura). Com operações
+                    // pendentes não dá para separar as do frame interrompido de
+                    // autocommits já confirmados: falha, em vez de descartá-las em silêncio.
+                    if !pending.is_empty() {
+                        return Err(Error::CorruptWal(*lsn));
+                    }
                     active_txn = Some(*txn_id);
                     bump(self, *txn_id);
-                    pending.clear();
                 }
                 WalRecord::Commit { txn_id, lsn } => {
                     if active_txn != Some(*txn_id) {
@@ -624,8 +629,13 @@ impl Db {
             })();
             if let Err(error) = logged {
                 if let Some(txn_id) = framed {
-                    // Garante que o frame parcial nunca engula registros futuros.
-                    let _ = wal.append(WalRecord::Abort { lsn: 0, txn_id });
+                    // Garante que o frame parcial nunca engula registros futuros. Se nem o
+                    // `Abort` couber, o WAL recusa novas escritas até a reabertura (que fecha
+                    // o frame): um autocommit confirmado depois dele sumiria no recovery.
+                    let closed = wal.append(WalRecord::Abort { lsn: 0, txn_id });
+                    if closed.is_err() {
+                        wal.poison();
+                    }
                 }
                 return Err(error);
             }
@@ -1279,6 +1289,10 @@ impl Db {
     /// WAL — arquivando-o quando há retenção para réplicas.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.ensure_open()?;
+        // Frame interrompido sem `Abort` no WAL (ver `Wal::poison`): avançar o checkpoint
+        // o tiraria do alcance do recovery e arquivá-lo levaria o `Begin` solto para o
+        // histórico das réplicas e do PITR. Só a reabertura fecha o frame.
+        self.wal_mut().check_usable()?;
         self.sync_wal()?;
         let next = self.wal_mut().next_lsn();
         self.meta.checkpoint_lsn = next.saturating_sub(1);
@@ -1411,6 +1425,13 @@ impl Db {
         // ainda exista (ex.: clones de um `SharedDb` em outras threads).
         self.lock = None;
         Ok(())
+    }
+
+    /// Entrega o lock do diretório a quem chamou, que continua dono dele depois do
+    /// `close`: [`crate::encryption::convert`] reescreve `data.mdb` com o banco fechado
+    /// e nenhum outro handle pode abri-lo no meio.
+    pub(crate) fn take_lock(&mut self) -> Option<File> {
+        self.lock.take()
     }
 
     /// Abandona o handle sem checkpoint (simula crash em testes).

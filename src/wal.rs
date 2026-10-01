@@ -290,7 +290,11 @@ pub struct Wal {
     len: u64,
     /// LSN do primeiro registro no arquivo atual (`None` = só cabeçalho).
     first_lsn: Option<u64>,
+    /// Cauda que só a reabertura conserta: ver [`Wal::poison`].
+    poisoned: bool,
 }
+
+const POISONED: &str = "WAL com transação incompleta: reabra o banco para recuperar";
 
 impl Wal {
     pub fn open(path: impl AsRef<Path>, next_lsn: u64) -> Result<Self> {
@@ -341,7 +345,24 @@ impl Wal {
             next_lsn,
             len: valid_len,
             first_lsn: records.first().map(WalRecord::lsn),
+            poisoned: false,
         })
+    }
+
+    /// Recusa novas escritas até a reabertura. Usado quando a cauda do arquivo ficou
+    /// com um frame BEGIN que nem o `Abort` conseguiu fechar (ou com um append parcial
+    /// que não pôde ser revertido): um registro gravado depois dela seria descartado
+    /// pelo recovery mesmo já confirmado ao cliente. A reabertura fecha o frame.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Erro se o WAL foi marcado por [`Wal::poison`].
+    pub(crate) fn check_usable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Other(POISONED.into()));
+        }
+        Ok(())
     }
 
     pub fn cipher(&self) -> Option<Arc<Cipher>> {
@@ -393,6 +414,7 @@ impl Wal {
     }
 
     pub fn append(&mut self, mut record: WalRecord) -> Result<u64> {
+        self.check_usable()?;
         let lsn = self.next_lsn;
         match &mut record {
             WalRecord::Insert { lsn: l, .. }
@@ -411,6 +433,8 @@ impl Wal {
             let rollback = self.file.set_len(previous_len);
             let _ = self.file.seek(SeekFrom::End(0));
             if rollback.is_err() {
+                // O frame parcial ficou no arquivo e esconderia o que viesse depois dele.
+                self.poisoned = true;
                 return Err(Error::Other(format!(
                     "falha ao reverter append parcial do WAL: {error}"
                 )));
@@ -562,5 +586,20 @@ mod tests {
     #[test]
     fn crc32_matches_reference_vector() {
         assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn poisoned_wal_refuses_appends() {
+        let name = format!("minidb-wal-poison-{}.log", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        let mut wal = super::Wal::open(&path, 1).unwrap();
+        let begin = super::WalRecord::Begin { lsn: 0, txn_id: 1 };
+        assert_eq!(wal.append(begin.clone()).unwrap(), 1);
+        wal.poison();
+        assert!(wal.append(begin).is_err());
+        assert_eq!(wal.next_lsn(), 2);
+        drop(wal);
+        std::fs::remove_file(&path).unwrap();
     }
 }

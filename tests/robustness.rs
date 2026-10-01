@@ -145,6 +145,12 @@ fn regex_compiler_and_matcher_never_panic() {
     assert!(Regex::new("^.*$", "").unwrap().is_match(&long));
     let _ = Regex::new("(a)*$", "").unwrap().is_match(&long);
     let _ = Regex::new("^((a|b))+c", "").unwrap().is_match(&long);
+    // Orçamento da varredura: uma busca quadrática legítima (`[a-z]+` recua em cada uma
+    // das 5 mil posições, uns 2,5e7 passos) ainda casa; as patológicas desistem logo.
+    let letters = format!("{} foo1", "a".repeat(5_000));
+    assert!(Regex::new("[a-z]+\\d", "").unwrap().is_match(&letters));
+    let _ = Regex::new("(a|aa)+$", "").unwrap().is_match(&long);
+    let _ = Regex::new("(a*)*b", "").unwrap().is_match(&long);
 }
 
 #[test]

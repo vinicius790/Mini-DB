@@ -865,3 +865,18 @@ fn tcp_connections_have_their_own_transactions() {
     assert!(ask(&mut o2, &mut l2, "ROLLBACK").starts_with("ERR"));
     drop((o1, o2, l1, l2));
 }
+
+#[test]
+fn hash_join_matches_numeric_text_with_numbers() {
+    let mut db = Db::open(tmpdir("hashjoin")).unwrap();
+    ok(&mut db, "CREATE TABLE hj_n (id INT PRIMARY KEY, v INT)");
+    ok(&mut db, "CREATE TABLE hj_t (id INT PRIMARY KEY, s TEXT)");
+    ok(&mut db, "INSERT INTO hj_n VALUES (1, 5), (2, 7)");
+    ok(
+        &mut db,
+        "INSERT INTO hj_t VALUES (1, '05'), (2, '5'), (3, 'x'), (4, '7.0')",
+    );
+    // `texto = número` compara como número: o hash join não pode perder essas linhas.
+    let sql = "SELECT a.id, b.id FROM hj_n a JOIN hj_t b ON b.s = a.v ORDER BY a.id, b.id";
+    assert_eq!(q(&mut db, sql), ["1|1", "1|2", "2|4"]);
+}

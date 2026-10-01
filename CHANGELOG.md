@@ -26,8 +26,20 @@ Segurança
   vez de estourar a pilha); `.*` e `\w+` não gastam pilha por caractere.
 - Criptografia em repouso: estado de conversão incompleto não apaga mais a chave; a
   chave nova é gravada com `fsync`. Chave privada TLS recebe 0600 antes da escrita.
+- SCRAM: o sal fictício de usuário inexistente sai de um segredo do processo; o
+  cliente não consegue mais recalculá-lo para descobrir quem existe.
+- Parser: uma expressão aceita até 1 000 operadores encadeados (`1 + 1 + ...`,
+  `a OR b OR ...`) e um comando até 500 `UNION`/`INTERSECT`/`EXCEPT`; acima disso é
+  erro, em vez de montar uma árvore que estoura a pilha do executor.
+- Regex: orçamento total de passos por varredura, além do limite por posição inicial.
+- `encrypt`/`decrypt`/`rekey` seguram o lock do diretório do início ao fim e recusam
+  um banco aberto.
 
 Correções
+- WAL: `Begin` com operações pendentes de outra transação volta a ser erro (não
+  descarta em silêncio); se nem o `Abort` de um frame interrompido couber no disco, o
+  WAL recusa escritas até a reabertura.
+- Hash join com chave de texto numérico e número (`'05' = 5`) não perde mais linhas.
 - Transação que apaga o pai que ela mesma referenciou não dá mais conflito falso de
   chave estrangeira; `TRUNCATE` do pai em transação protege contra filha concorrente.
 - WAL: CRC ruim seguido só de zeros é cauda de escrita interrompida (queda de energia),

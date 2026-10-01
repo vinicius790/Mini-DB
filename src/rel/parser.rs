@@ -842,12 +842,30 @@ struct Parser<'s> {
     params: usize,
     /// Profundidade atual de expressões aninhadas (limita a recursão).
     depth: usize,
+    /// Expressões em curso: zero fora de qualquer expressão.
+    expr_level: usize,
+    /// Elos criados pelos laços de operadores na expressão de topo atual.
+    links: usize,
+    /// Operações de conjunto já vistas no comando.
+    set_ops: usize,
 }
 
 /// Cada nível de parênteses consome ~3 unidades (`expr`, `not`, `unary`): o
-/// limite equivale a ~100 níveis. Limita a recursão do parser, não a altura da
-/// árvore de cadeias longas de operadores (`1 + 1 + ...`), montadas em laço.
+/// limite equivale a ~100 níveis. Limita a recursão do parser; a altura das
+/// cadeias de operadores montadas em laço (`1 + 1 + ...`) fica por conta de
+/// `MAX_EXPR_LINKS` e `MAX_SET_OPS`.
 const MAX_EXPR_DEPTH: usize = 300;
+
+/// Elos que os laços de operadores (`OR`, `AND`, `+`, `*`, `||`, `::tipo`...)
+/// podem criar numa expressão de topo: cada elo aumenta em um a altura da
+/// árvore, que o executor percorre recursivamente. A conta é por expressão de
+/// topo, não por comando: um `INSERT` de milhares de linhas não é afetado.
+/// Subexpressões e subconsultas somam na conta da expressão que as contém,
+/// mesmo quando são itens de uma lista (`IN`, argumentos).
+const MAX_EXPR_LINKS: usize = 1_000;
+
+/// `UNION`/`INTERSECT`/`EXCEPT` por comando: cada um aninha uma consulta inteira.
+const MAX_SET_OPS: usize = 500;
 
 /// Comando analisado e quantos parâmetros ele espera.
 pub fn parse(sql: &str) -> Result<(Stmt, usize)> {
@@ -981,6 +999,9 @@ impl<'s> Parser<'s> {
             next_param: 0,
             params: 0,
             depth: 0,
+            expr_level: 0,
+            links: 0,
+            set_ops: 0,
         })
     }
 
@@ -989,6 +1010,27 @@ impl<'s> Parser<'s> {
         if self.depth > MAX_EXPR_DEPTH {
             self.depth -= 1;
             return Err(Error::Sql("expressão aninhada demais".into()));
+        }
+        Ok(())
+    }
+
+    /// Roda `f` dentro de uma expressão: a de topo zera a conta de elos, as
+    /// aninhadas (parênteses, argumentos, subconsultas) somam na mesma conta.
+    fn in_expr(&mut self, f: fn(&mut Self) -> Result<Expr>) -> Result<Expr> {
+        if self.expr_level == 0 {
+            self.links = 0;
+        }
+        self.expr_level += 1;
+        let r = f(self);
+        self.expr_level -= 1;
+        r
+    }
+
+    /// Cobra um elo da expressão de topo atual (ver `MAX_EXPR_LINKS`).
+    fn link(&mut self) -> Result<()> {
+        self.links += 1;
+        if self.links > MAX_EXPR_LINKS {
+            return Err(Error::Sql("expressão longa demais".into()));
         }
         Ok(())
     }
@@ -1961,7 +2003,7 @@ impl<'s> Parser<'s> {
                     (e, text)
                 } else {
                     let from = self.pos;
-                    let e = self.unary()?;
+                    let e = self.in_expr(Self::unary)?;
                     (e, self.text_since(from))
                 };
                 col.default_sql = match &e {
@@ -2227,6 +2269,11 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             };
+            // Cada operação aninha a consulta à esquerda: a conta vale para o comando todo.
+            self.set_ops += 1;
+            if self.set_ops > MAX_SET_OPS {
+                return Err(Error::Sql("operações de conjunto demais".into()));
+            }
             let all = self.eat_kw("all");
             if !all {
                 self.eat_kw("distinct");
@@ -2409,6 +2456,10 @@ impl<'s> Parser<'s> {
                 } else if self.eat_kw("using") {
                     // USING (a, b) => ON esq.a = dir.a AND esq.b = dir.b
                     let cols = self.ident_list()?;
+                    // Cada coluna vira um elo da cadeia de AND montada abaixo.
+                    if cols.len() > MAX_EXPR_LINKS {
+                        return Err(Error::Sql("USING com colunas demais".into()));
+                    }
                     using = cols.clone();
                     let left_alias = from.as_ref().map(|f: &FromItem| f.alias.clone());
                     let mut cond: Option<Expr> = None;
@@ -2466,7 +2517,7 @@ impl<'s> Parser<'s> {
 
     pub(crate) fn expr(&mut self) -> Result<Expr> {
         self.enter()?;
-        let r = self.expr_inner();
+        let r = self.in_expr(Self::expr_inner);
         self.depth -= 1;
         r
     }
@@ -2474,6 +2525,7 @@ impl<'s> Parser<'s> {
     fn expr_inner(&mut self) -> Result<Expr> {
         let mut left = self.and()?;
         while self.eat_kw("or") {
+            self.link()?;
             left = Expr::Bin(Box::new(left), BinOp::Or, Box::new(self.and()?));
         }
         Ok(left)
@@ -2482,6 +2534,7 @@ impl<'s> Parser<'s> {
     fn and(&mut self) -> Result<Expr> {
         let mut left = self.not()?;
         while self.eat_kw("and") {
+            self.link()?;
             left = Expr::Bin(Box::new(left), BinOp::And, Box::new(self.not()?));
         }
         Ok(left)
@@ -2678,6 +2731,7 @@ impl<'s> Parser<'s> {
             } else {
                 return Ok(left);
             };
+            self.link()?;
             left = Expr::Bin(Box::new(left), op, Box::new(self.additive()?));
         }
     }
@@ -2702,9 +2756,11 @@ impl<'s> Parser<'s> {
                 } else {
                     return Ok(left);
                 };
+                self.link()?;
                 left = Expr::Func(func.into(), vec![left, self.term()?]);
                 continue;
             };
+            self.link()?;
             left = Expr::Bin(Box::new(left), op, Box::new(self.term()?));
         }
     }
@@ -2721,6 +2777,7 @@ impl<'s> Parser<'s> {
             } else {
                 return Ok(left);
             };
+            self.link()?;
             left = Expr::Bin(Box::new(left), op, Box::new(self.unary()?));
         }
     }
@@ -2743,6 +2800,9 @@ impl<'s> Parser<'s> {
             return Ok(Expr::BitNot(Box::new(self.unary()?)));
         }
         let mut e = self.primary()?;
+        // O primeiro sufixo (`::tipo`, `[i]`) não conta: `IN ($1::int, $2::int, ...)` não é
+        // uma cadeia. Do segundo em diante, cada sufixo é um elo.
+        let mut suffixed = false;
         loop {
             // x::tipo (PostgreSQL); tipos do catálogo (regclass, oid, name...) não convertem.
             if self.eat_sym("::") {
@@ -2775,6 +2835,9 @@ impl<'s> Parser<'s> {
                 e = Expr::Func("array_get".into(), vec![e, index]);
             } else {
                 break;
+            }
+            if std::mem::replace(&mut suffixed, true) {
+                self.link()?;
             }
         }
         Ok(e)
@@ -3176,6 +3239,26 @@ mod tests {
                 // Aninhamento comum continua valendo.
                 let fine = format!("SELECT {}1{}", "(".repeat(40), ")".repeat(40));
                 assert!(parse(&fine).is_ok());
+                // Cadeias montadas em laço: a altura da árvore também tem limite.
+                let sums = format!("SELECT 1{}", " + 1".repeat(100_000));
+                assert!(parse(&sums).is_err());
+                let ors = format!("SELECT 1 FROM t WHERE a{}", " OR a".repeat(100_000));
+                assert!(parse(&ors).is_err());
+                let casts = format!("SELECT 1{}", "::int".repeat(100_000));
+                assert!(parse(&casts).is_err());
+                let tail = " UNION ALL SELECT 1";
+                let unions = format!("SELECT 1{}", tail.repeat(MAX_SET_OPS + 1));
+                assert!(parse(&unions).is_err());
+                // Cadeias e comandos em lote de tamanho comum continuam valendo.
+                let sums = format!("SELECT 1{}", " + 1".repeat(999));
+                assert!(parse(&sums).is_ok());
+                let unions = format!("SELECT 1{}", tail.repeat(99));
+                assert!(parse(&unions).is_ok());
+                let row = "(1, 2 + 3 * 4), ";
+                let rows = format!("INSERT INTO t VALUES {}(0, 0)", row.repeat(4_999));
+                assert!(parse(&rows).is_ok());
+                let list = format!("SELECT 1 FROM t WHERE x IN ({}0)", "1, ".repeat(2_999));
+                assert!(parse(&list).is_ok());
             })
             .unwrap()
             .join()

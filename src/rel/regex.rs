@@ -2,7 +2,8 @@
 //! `^`/`$`, classes `[a-z]`/`[^...]`, `\d \w \s \b` e negações, quantificadores
 //! `* + ? {n,m}` (gulosos e preguiçosos `*?`), grupos `(...)`/`(?:...)` com
 //! captura e alternância `|`, sinalizador `i`. Casamento por retrocesso com
-//! limite de passos (padrões patológicos falham em vez de travar).
+//! limite de passos, por posição inicial e por varredura (padrões patológicos
+//! falham em vez de travar).
 
 use crate::error::{Error, Result};
 
@@ -31,6 +32,10 @@ pub struct Regex {
 }
 
 const MAX_STEPS: usize = 2_000_000;
+/// Passos de uma varredura inteira, somados entre as posições iniciais (`MAX_STEPS` vale
+/// para cada uma; sem a soma o pior caso seria `MAX_STEPS` vezes o tamanho do texto).
+/// Folga para buscas quadráticas legítimas: `[a-z]+\d` sobre 10 mil letras gasta 1e8.
+const MAX_TOTAL_STEPS: usize = 100 * MAX_STEPS;
 // ponytail: teto fixo, estimado para 2 MiB de pilha em build de depuração; um grupo
 // repetido (`(ab)*`) casa por volta de 100 voltas. Subir só medindo a pilha no CI.
 /// Chamadas aninhadas de `Matcher::m`; acima disso a busca é abandonada, como em
@@ -536,6 +541,13 @@ impl Regex {
 
     /// Primeiro casamento a partir de `start`: `(início, fim, capturas)`.
     pub fn find_at(&self, text: &[char], start: usize) -> Option<Match> {
+        let mut budget = MAX_TOTAL_STEPS;
+        self.find_from(text, start, &mut budget)
+    }
+
+    /// `find_at` que desconta de `budget` os passos de cada posição inicial; estourado o
+    /// orçamento, a busca é abandonada (`None`), como em `MAX_STEPS`.
+    fn find_from(&self, text: &[char], start: usize, budget: &mut usize) -> Option<Match> {
         if text.len() > MAX_TEXT_CHARS {
             return None;
         }
@@ -551,9 +563,10 @@ impl Regex {
             m.caps.fill(None);
             let found = m.m(&self.root, s, &mut |_, e| Some(e));
             // Busca cortada pelo limite: um `Some` aqui seria um casamento truncado.
-            if m.steps > MAX_STEPS {
+            if m.steps > MAX_STEPS || m.steps > *budget {
                 return None;
             }
+            *budget -= m.steps;
             if let Some(end) = found {
                 m.caps[0] = Some((s, end));
                 return Some((s, end, m.caps));
@@ -567,13 +580,15 @@ impl Regex {
         self.find_at(&chars, 0).is_some()
     }
 
-    /// Todas as ocorrências (não sobrepostas).
+    /// Todas as ocorrências (não sobrepostas). O orçamento de passos é um só para a
+    /// varredura inteira: esgotado, devolve as ocorrências achadas até ali.
     pub fn find_all(&self, text: &str) -> Vec<Match> {
         let chars: Vec<char> = text.chars().collect();
         let mut out = Vec::new();
+        let mut budget = MAX_TOTAL_STEPS;
         let mut pos = 0;
         while pos <= chars.len() {
-            let Some((s, e, caps)) = self.find_at(&chars, pos) else {
+            let Some((s, e, caps)) = self.find_from(&chars, pos, &mut budget) else {
                 break;
             };
             out.push((s, e, caps));
@@ -663,5 +678,17 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn total_budget_is_shared_by_start_positions() {
+        // `a+b` recua em cada uma das 100 posições iniciais (uns 200 passos cada) antes
+        // de chegar ao `ab` do fim: nenhuma estoura sozinha, a soma passa de 10 mil.
+        let re = Regex::new("a+b", "").unwrap();
+        let text: Vec<char> = format!("{} ab", "a".repeat(100)).chars().collect();
+        let (mut small, mut large) = (1_000, 1_000_000);
+        assert!(re.find_from(&text, 0, &mut small).is_none());
+        let found = re.find_from(&text, 0, &mut large);
+        assert_eq!(found.map(|(s, e, _)| (s, e)), Some((101, 103)));
     }
 }
