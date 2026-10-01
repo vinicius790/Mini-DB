@@ -845,7 +845,8 @@ struct Parser<'s> {
 }
 
 /// Cada nível de parênteses consome ~3 unidades (`expr`, `not`, `unary`): o
-/// limite equivale a ~100 níveis, bem antes de a recursão ameaçar a pilha.
+/// limite equivale a ~100 níveis. Limita a recursão do parser, não a altura da
+/// árvore de cadeias longas de operadores (`1 + 1 + ...`), montadas em laço.
 const MAX_EXPR_DEPTH: usize = 300;
 
 /// Comando analisado e quantos parâmetros ele espera.
@@ -1126,6 +1127,14 @@ impl<'s> Parser<'s> {
     }
 
     fn statement(&mut self) -> Result<Stmt> {
+        // `EXPLAIN EXPLAIN ...` e `CREATE TRIGGER` no corpo de um gatilho recorrem por aqui.
+        self.enter()?;
+        let r = self.statement_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn statement_inner(&mut self) -> Result<Stmt> {
         if self.peek_kw("select") || self.peek_kw("with") || self.peek_kw("values") {
             return Ok(Stmt::Query(Box::new(self.query()?)));
         }
@@ -2977,6 +2986,9 @@ impl<'s> Parser<'s> {
             // `agg(x) FILTER (WHERE c)` ≡ `agg(CASE WHEN c THEN x END)`: agregados
             // ignoram NULL. `COUNT(*)` conta as linhas em que `c` vale.
             let value = if args.is_empty() {
+                if agg != Some(AggFn::Count) {
+                    return Err(Error::Sql(format!("{name}() precisa de argumento")));
+                }
                 Expr::Lit(Value::Int(1))
             } else {
                 args.remove(0)
@@ -3138,6 +3150,7 @@ mod tests {
             )
         );
         assert!(parse("SELECT lower(x) FILTER (WHERE x > 1) FROM t").is_err());
+        assert!(parse("SELECT sum() FILTER (WHERE x > 1) FROM t").is_err());
     }
 
     #[test]
@@ -3158,6 +3171,8 @@ mod tests {
                     ")".repeat(2_000)
                 );
                 assert!(parse(&queries).is_err());
+                let explains = format!("{}SELECT 1", "EXPLAIN ".repeat(2_000));
+                assert!(parse(&explains).is_err());
                 // Aninhamento comum continua valendo.
                 let fine = format!("SELECT {}1{}", "(".repeat(40), ")".repeat(40));
                 assert!(parse(&fine).is_ok());

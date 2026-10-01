@@ -292,7 +292,14 @@ pub fn restore(
                 continue;
             }
             if lsn != last_lsn + 1 && gap.is_none() {
-                gap = Some((last_lsn + 1, lsn - 1));
+                // Só conta a lacuna que começa dentro do que foi pedido.
+                let wanted = match target {
+                    RestoreTarget::Lsn(max) => last_lsn < max,
+                    _ => true,
+                };
+                if wanted {
+                    gap = Some((last_lsn + 1, lsn - 1));
+                }
             }
             if let WalRecord::Time { unix_ms, .. } = &rec {
                 clock = *unix_ms;

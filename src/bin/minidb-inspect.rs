@@ -22,7 +22,15 @@ fn run() -> mini_db::Result<()> {
     // o handle é largado sem checkpoint: a inspeção não reescreve `data.mdb`.
     let secret = env::var("MINIDB_PASSPHRASE").unwrap_or_default();
     let pass = (!secret.is_empty()).then_some(secret.as_str());
-    let db = Db::open_encrypted(&dir, 1024, true, pass)?;
+    let db = Db::open_encrypted(dir, 1024, true, pass)?;
+    // Também em erro (page_id inválido, página corrompida): um `?` com o handle
+    // vivo deixaria o `Drop` fazer o checkpoint.
+    let result = inspect(&db, &args);
+    db.drop_without_checkpoint();
+    result
+}
+
+fn inspect(db: &Db, args: &[String]) -> mini_db::Result<()> {
     print!("{}", db.inspect_meta_text());
     if let Some(id_s) = args.first() {
         if id_s != "--hex" {
@@ -41,6 +49,5 @@ fn run() -> mini_db::Result<()> {
             }
         }
     }
-    db.drop_without_checkpoint();
     Ok(())
 }

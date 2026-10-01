@@ -441,7 +441,8 @@ impl Wal {
         Ok(())
     }
 
-    /// Lê todos os registros válidos; para no primeiro frame truncado/CRC inválido.
+    /// Lê todos os registros válidos. Para na cauda truncada ou com CRC ruim (escrita
+    /// interrompida); CRC ruim seguido de dados não nulos é corrupção e dá `CorruptWal`.
     pub fn read_all(path: impl AsRef<Path>) -> Result<(u64, Vec<WalRecord>)> {
         Self::read_all_with(path, None)
     }
@@ -495,10 +496,11 @@ impl Wal {
                 break;
             }
             if crc32(&body) != crc_expected {
-                // Último frame com CRC ruim = escrita interrompida: ignora. Com dados
-                // depois dele é corrupção no meio do log: erro, em vez de descartar
-                // em silêncio (e truncar) transações já confirmadas.
-                if frame_end < file_len {
+                // Cauda de escrita interrompida: o frame ruim é o último, ou depois dele
+                // só há zeros (arquivo estendido sem os dados chegarem ao disco numa
+                // queda de energia): ignora. Com dados depois dele é corrupção no meio
+                // do log: erro, em vez de descartar transações já confirmadas.
+                if frame_end < file_len && !only_zeros_from(&mut file, frame_end)? {
                     return Err(Error::CorruptWal(offset));
                 }
                 break;
@@ -529,6 +531,21 @@ impl Wal {
 
         let next_lsn = if max_lsn == 0 { 1 } else { max_lsn + 1 };
         Ok((next_lsn, records))
+    }
+}
+
+/// `true` se o arquivo só tem zeros de `from` até o fim.
+fn only_zeros_from(file: &mut File, from: u64) -> Result<bool> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
     }
 }
 

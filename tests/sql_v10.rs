@@ -138,6 +138,7 @@ fn users_roles_and_grants_govern_sessions() {
         "SELECT j.id FROM jogos j WHERE j.id IN (SELECT id FROM segredos)"
     )
     .contains("segredos"));
+    assert!(denied(&mut s, "SELECT 1 LIMIT (SELECT id FROM segredos)").contains("segredos"));
     assert!(denied(&mut s, "CREATE TABLE x (id INT)").contains("CREATE"));
     assert!(denied(&mut s, "DROP TABLE jogos").contains("CREATE"));
     assert!(denied(&mut s, "CREATE USER hacker PASSWORD 'h'").contains("superusuário"));
@@ -160,6 +161,8 @@ fn users_roles_and_grants_govern_sessions() {
         s.execute("SELECT * FROM jogos"),
         Err(Error::Forbidden(_))
     ));
+    // Sem SELECT, o UPDATE que resta não lê as linhas por `RETURNING`.
+    assert!(denied(&mut s, "UPDATE jogos SET preco = preco RETURNING *").contains("SELECT"));
     r.execute("GRANT ALL ON * TO ana").unwrap();
     s.execute("SELECT * FROM segredos").unwrap();
     s.execute("CREATE TABLE ok (id INT)").unwrap();

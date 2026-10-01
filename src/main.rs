@@ -76,7 +76,8 @@ fn start_background(
     }
     let rcfg = repl_config(cfg);
     if let Some(addr) = primary {
-        let timeout = (cfg.sync_timeout_ms > 0).then(|| Duration::from_millis(cfg.sync_timeout_ms));
+        let timeout =
+            (cfg.sync_timeout_ms > 0).then_some(Duration::from_millis(cfg.sync_timeout_ms));
         replication::enable_feed(db, rcfg.max_feed_ops)?;
         replication::set_sync_replicas(db, cfg.sync_replicas, timeout)?;
         let (db, rcfg) = (db.clone(), rcfg.clone());
@@ -193,7 +194,7 @@ fn run() -> mini_db::Result<()> {
             let addr = args.get(1).cloned().unwrap_or_else(|| cfg.tcp_addr.clone());
             let db = SharedDb::new(open_configured_db(&path, &cfg)?);
             start_background(&db, &cfg, primary, replica_of)?;
-            start_pg(&db, &cfg, &path);
+            start_pg(&db, &cfg, &path)?;
             mini_db::server::serve_with(db, &addr, cfg.net())
         }
         "pg" | "postgres" => {
@@ -338,7 +339,7 @@ fn run() -> mini_db::Result<()> {
                 .unwrap_or_else(|| cfg.http_addr.clone());
             let db = SharedDb::new(open_configured_db(&path, &cfg)?);
             start_background(&db, &cfg, primary, replica_of)?;
-            start_pg(&db, &cfg, &path);
+            start_pg(&db, &cfg, &path)?;
             let metrics = Arc::new(Metrics::new());
             // HTTPS só quando pedido (https = true): clientes HTTP simples esperam texto claro.
             let opts = if cfg.https {
@@ -435,23 +436,19 @@ fn open_cli_db(path: &Path) -> mini_db::Result<Db> {
 
 /// Escuta o protocolo PostgreSQL em paralelo (`pg_addr` vazio desliga).
 /// Os arquivos TLS ficam no diretório do banco aberto, não em `cfg.path`.
-fn start_pg(db: &SharedDb, cfg: &Config, dir: &Path) {
+/// Erro de TLS aborta a subida: cair para texto claro desligaria `tls_client_auth`.
+fn start_pg(db: &SharedDb, cfg: &Config, dir: &Path) -> mini_db::Result<()> {
     if cfg.pg_addr.is_empty() {
-        return;
+        return Ok(());
     }
-    let opts = match cfg.net_with_tls(dir) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("TLS desligado: {e}");
-            cfg.net()
-        }
-    };
+    let opts = cfg.net_with_tls(dir)?;
     let (db, addr) = (db.clone(), cfg.pg_addr.clone());
     std::thread::spawn(move || {
         if let Err(e) = mini_db::pg::serve(db, &addr, opts) {
             eprintln!("erro no protocolo PostgreSQL: {e}");
         }
     });
+    Ok(())
 }
 
 #[cfg(test)]

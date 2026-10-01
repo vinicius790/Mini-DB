@@ -129,7 +129,10 @@ pub fn open_key(dir: &Path, passphrase: Option<&str>, has_data: bool) -> Result<
             raw.extend_from_slice(&KEY_ITERATIONS.to_le_bytes());
             raw.extend_from_slice(&salt);
             raw.extend_from_slice(&cipher.check());
-            fs::write(&path, raw)?;
+            // Com `sync_all`: o arquivo guarda o sal; sem ele a senha não abre mais nada.
+            let mut file = fs::File::create(&path)?;
+            std::io::Write::write_all(&mut file, &raw)?;
+            file.sync_all()?;
             Ok(Some(cipher))
         }
         (Some(_), None) => Err(Error::Other(
@@ -167,11 +170,24 @@ pub fn recover_convert(dir: &Path) -> Result<()> {
     let state_path = dir.join(CONVERT_STATE);
     let tmp = dir.join(CONVERT_TMP);
     let old_key = dir.join(CONVERT_OLD_KEY);
-    let Ok(state) = fs::read(&state_path) else {
-        // Sem estado gravado nada foi trocado: no máximo sobrou o temporário vazio.
-        let _ = fs::remove_file(&tmp);
-        return Ok(());
+    let state = match fs::read(&state_path) {
+        Ok(state) => state,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Sem estado gravado nada foi trocado: no máximo sobrou o temporário vazio.
+            let _ = fs::remove_file(&tmp);
+            return Ok(());
+        }
+        // Erro de leitura não decide nada: apagar o temporário aqui faria a próxima
+        // abertura concluir que a troca aconteceu.
+        Err(e) => return Err(e.into()),
     };
+    if state != STATE_ENCRYPTED && state != STATE_PLAIN {
+        // Estado incompleto: a queda foi durante a gravação dele, antes de qualquer
+        // troca. A chave e o `data.mdb` são os originais; só limpa os marcadores.
+        let _ = fs::remove_file(&tmp);
+        fs::remove_file(&state_path)?;
+        return Ok(());
+    }
     if tmp.exists() {
         if state == STATE_ENCRYPTED {
             // A chave original pode já ter sido movida; a nova (se houver) é descartada.

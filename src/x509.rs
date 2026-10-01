@@ -567,12 +567,13 @@ pub(crate) fn write_private(path: &std::path::Path, text: &str) -> Result<()> {
         opts.mode(0o600);
     }
     let mut file = opts.open(path)?;
-    file.write_all(text.as_bytes())?;
+    // Arquivo que já existia mantém o modo antigo: aperta antes de gravar o segredo.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    file.write_all(text.as_bytes())?;
     Ok(())
 }
 

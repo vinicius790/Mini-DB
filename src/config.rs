@@ -186,7 +186,7 @@ impl Config {
             cfg.pg_addr = v;
         }
         if let Ok(v) = env::var("MINIDB_HTTPS") {
-            cfg.https = truthy(&v);
+            set_bool(&mut cfg.https, &v);
         }
         for (var, slot) in [
             ("MINIDB_TLS_CERT", &mut cfg.tls_cert),
@@ -201,7 +201,7 @@ impl Config {
             cfg.tls_client_auth = Some(v).filter(|v| !v.is_empty());
         }
         if let Ok(v) = env::var("MINIDB_TLS") {
-            cfg.tls = truthy(&v);
+            set_bool(&mut cfg.tls, &v);
         }
         if let Ok(v) = env::var("MINIDB_PASSPHRASE") {
             cfg.passphrase = Some(v).filter(|p| !p.is_empty());
@@ -212,7 +212,7 @@ impl Config {
             }
         }
         if let Ok(v) = env::var("MINIDB_FSYNC") {
-            cfg.fsync = truthy(&v);
+            set_bool(&mut cfg.fsync, &v);
         }
         for (var, key) in [
             ("MINIDB_TOKEN", "token"),
@@ -242,17 +242,24 @@ fn parse_into(text: &str, cfg: &mut Config) {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        let v = v.trim().trim_matches('"').trim_matches('\'');
+        let v = v.trim();
+        // `chave = "valor"  # comentário`: vale só o que está entre as aspas.
+        let quoted = ['"', '\'']
+            .into_iter()
+            .find_map(|q| v.strip_prefix(q)?.split_once(q));
+        let v = quoted.map_or(v.trim_matches('"').trim_matches('\''), |(inner, _)| inner);
         set(cfg, k.trim(), v);
     }
 }
 
-/// Booleanos de configuração: `1`, `true`, `yes` ou `on` (qualquer caixa).
-fn truthy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// Booleanos de configuração (qualquer caixa): `1`/`true`/`yes`/`on` ligam e
+/// `0`/`false`/`no`/`off` desligam; outro valor mantém o que já estava.
+fn set_bool(slot: &mut bool, v: &str) {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => *slot = true,
+        "0" | "false" | "no" | "off" => *slot = false,
+        _ => {}
+    }
 }
 
 fn set(cfg: &mut Config, key: &str, v: &str) {
@@ -268,13 +275,13 @@ fn set(cfg: &mut Config, key: &str, v: &str) {
         "http_addr" | "http" => cfg.http_addr = v.to_string(),
         "pg_addr" | "pg" | "postgres" => cfg.pg_addr = v.to_string(),
         "passphrase" => cfg.passphrase = Some(v.to_string()).filter(|p| !p.is_empty()),
-        "tls" | "ssl" => cfg.tls = truthy(v),
-        "https" => cfg.https = truthy(v),
+        "tls" | "ssl" => set_bool(&mut cfg.tls, v),
+        "https" => set_bool(&mut cfg.https, v),
         "tls_cert" => cfg.tls_cert = Some(PathBuf::from(v)).filter(|p| !p.as_os_str().is_empty()),
         "tls_key" => cfg.tls_key = Some(PathBuf::from(v)).filter(|p| !p.as_os_str().is_empty()),
         "tls_ca" => cfg.tls_ca = Some(PathBuf::from(v)).filter(|p| !p.as_os_str().is_empty()),
         "tls_client_auth" => cfg.tls_client_auth = Some(v.to_string()).filter(|v| !v.is_empty()),
-        "fsync" => cfg.fsync = truthy(v),
+        "fsync" => set_bool(&mut cfg.fsync, v),
         "token" => cfg.token = Some(v.to_string()).filter(|t| !t.is_empty()),
         "max_connections" => num(v, &mut cfg.max_connections),
         "max_body_bytes" => num(v, &mut cfg.max_body_bytes),
@@ -285,5 +292,20 @@ fn set(cfg: &mut Config, key: &str, v: &str) {
         "auto_checkpoint_mb" => num(v, &mut cfg.auto_checkpoint_mb),
         "maintenance_secs" => num(v, &mut cfg.maintenance_secs),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_value_drops_trailing_comment_and_unknown_bool_keeps_default() {
+        let text = "tls_client_auth = \"required\"  # off\ntls = enabled\nfsync = off\n";
+        let mut cfg = Config::default();
+        parse_into(text, &mut cfg);
+        assert_eq!(cfg.tls_client_auth.as_deref(), Some("required"));
+        assert!(cfg.tls, "valor desconhecido mantém o padrão");
+        assert!(!cfg.fsync);
     }
 }

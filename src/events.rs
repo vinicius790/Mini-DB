@@ -145,8 +145,8 @@ impl EventBus {
         self.lock().head_lsn
     }
 
-    /// Mudanças com LSN maior que `since`, até `limit`; espera até `timeout`
-    /// se ainda não há nenhuma.
+    /// Mudanças com LSN maior que `since`, cerca de `limit` (o lote vai até o fim do
+    /// último commit, para nunca cortá-lo); espera até `timeout` se ainda não há nenhuma.
     pub fn changes_since(
         &self,
         since: u64,

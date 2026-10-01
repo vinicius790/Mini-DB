@@ -27,6 +27,8 @@ const SSL_REQUEST: u32 = 80_877_103;
 const GSSENC_REQUEST: u32 = 80_877_104;
 const CANCEL_REQUEST: u32 = 80_877_102;
 const MAX_MESSAGE: usize = 256 << 20;
+/// Antes da autenticação (SASL/senha) o cliente ainda é anônimo: como o PostgreSQL.
+const MAX_AUTH_MESSAGE: usize = 65_535;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 // OIDs de tipos do PostgreSQL.
@@ -203,12 +205,13 @@ fn read_body(r: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-/// Próxima mensagem do cliente: `(tipo, corpo)`.
-fn read_message(r: &mut impl Read) -> Result<(u8, Vec<u8>)> {
+/// Próxima mensagem do cliente: `(tipo, corpo)`, com corpo de até `max` bytes
+/// (conferido antes de alocar).
+fn read_message(r: &mut impl Read, max: usize) -> Result<(u8, Vec<u8>)> {
     let mut ty = [0u8; 1];
     r.read_exact(&mut ty)?;
     let len = read_u32(r)? as usize;
-    if len < 4 {
+    if len < 4 || len - 4 > max {
         return Err(Error::Server("tamanho de mensagem inválido".into()));
     }
     Ok((ty[0], read_body(r, len - 4)?))
@@ -621,6 +624,7 @@ impl Conn<'_> {
             .collect();
         if statements.is_empty() {
             send(w, b'I', &[])?;
+            self.send_notifications(w)?;
             return ready(w, self.status());
         }
         for stmt in statements {
@@ -907,7 +911,7 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
         auth_body.extend_from_slice(&body);
         send(&mut ch, b'R', &auth_body)?;
         ch.flush()?;
-        let (ty, body) = read_message(&mut ch)?;
+        let (ty, body) = read_message(&mut ch, MAX_AUTH_MESSAGE)?;
         if ty != b'p' {
             return Err(Error::Server("esperava SASLInitialResponse".into()));
         }
@@ -942,7 +946,7 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
         cont.extend_from_slice(server_first.as_bytes());
         send(&mut ch, b'R', &cont)?;
         ch.flush()?;
-        let (ty, body) = read_message(&mut ch)?;
+        let (ty, body) = read_message(&mut ch, MAX_AUTH_MESSAGE)?;
         if ty != b'p' {
             return Err(Error::Server("esperava SASLResponse".into()));
         }
@@ -966,7 +970,7 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
     } else if let Some(token) = &opts.token {
         send(&mut ch, b'R', &3u32.to_be_bytes())?;
         ch.flush()?;
-        let (ty, body) = read_message(&mut ch)?;
+        let (ty, body) = read_message(&mut ch, MAX_AUTH_MESSAGE)?;
         let mut pos = 0;
         let given = take_cstr(&body, &mut pos).unwrap_or_default();
         if ty != b'p' || !crate::crypto::constant_time_eq(given.as_bytes(), token.as_bytes()) {
@@ -1023,12 +1027,21 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
         failed: false,
     };
     let mut skipping = false; // erro no protocolo estendido: ignora até Sync
+    // Entrou em modo aberto (sem usuários nem token): se alguém criar o primeiro
+    // usuário, a conexão é encerrada e o cliente reconecta autenticando (como no TCP).
+    let open_mode = !has_users && opts.token.is_none();
     loop {
-        let (ty, body) = match read_message(&mut ch) {
+        let (ty, body) = match read_message(&mut ch, MAX_MESSAGE) {
             Ok(m) => m,
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        // `Sync` não executa nada: fecha o lote em que o próprio `CREATE USER` veio.
+        if open_mode && !matches!(ty, b'X' | b'S') && conn.session.auth_required()? {
+            error_response(&mut ch, "28000", "autenticação exigida: reconecte")?;
+            ch.flush()?;
+            return Ok(());
+        }
         match ty {
             b'X' => return Ok(()),
             b'S' => {

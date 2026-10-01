@@ -10,7 +10,7 @@ fn main() {
     // o handle é largado sem checkpoint: a verificação não reescreve `data.mdb`.
     let secret = env::var("MINIDB_PASSPHRASE").unwrap_or_default();
     let pass = (!secret.is_empty()).then_some(secret.as_str());
-    let opened = Db::open_encrypted(&dir, 1024, true, pass);
+    let opened = Db::open_encrypted(dir, 1024, true, pass);
     match opened.and_then(|db| {
         let r = db.verify();
         db.drop_without_checkpoint();

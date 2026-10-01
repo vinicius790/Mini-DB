@@ -343,6 +343,9 @@ fn tables_of_query(q: &Query, out: &mut Vec<String>, ctes: &mut Vec<String>) {
     for o in &q.order_by {
         tables_of_expr(&o.expr, out, ctes);
     }
+    for e in q.limit.iter().chain(q.offset.iter()) {
+        tables_of_expr(e, out, ctes);
+    }
     ctes.truncate(before);
 }
 
@@ -449,6 +452,10 @@ pub fn required(stmt: &Stmt) -> Requirement {
             ..
         } => {
             let mut need = vec![(table.clone(), Insert)];
+            // `RETURNING` devolve linhas da tabela: exige SELECT, como uma leitura.
+            if !returning.is_empty() {
+                need.push((table.clone(), Select));
+            }
             let mut exprs: Vec<&Expr> = returning_exprs(returning);
             if let Some(OnConflict::Update { sets, filter }) = on_conflict {
                 exprs.extend(sets.iter().map(|(_, e)| e));
@@ -475,6 +482,9 @@ pub fn required(stmt: &Stmt) -> Requirement {
             returning,
         } => {
             let mut need = vec![(table.clone(), Update)];
+            if !returning.is_empty() {
+                need.push((table.clone(), Select));
+            }
             let mut exprs: Vec<&Expr> = sets.iter().map(|(_, e)| e).chain(filter.iter()).collect();
             exprs.extend(returning_exprs(returning));
             need.extend(reads_expr(&exprs));
@@ -486,6 +496,9 @@ pub fn required(stmt: &Stmt) -> Requirement {
             returning,
         } => {
             let mut need = vec![(table.clone(), Delete)];
+            if !returning.is_empty() {
+                need.push((table.clone(), Select));
+            }
             let mut exprs: Vec<&Expr> = filter.iter().collect();
             exprs.extend(returning_exprs(returning));
             need.extend(reads_expr(&exprs));
@@ -569,10 +582,13 @@ pub(crate) fn effective(src: &dyn Catalog, who: &Principal) -> Result<Vec<Grant>
 }
 
 fn allows(grants: &[Grant], object: &str, p: Privilege) -> bool {
-    grants
+    // Soma os bits de todas as concessões que valem para o objeto: `ALL` pode
+    // estar dividido entre a concessão direta e a de um papel.
+    let held = grants
         .iter()
         .filter(|g| g.object == "*" || g.object == object)
-        .any(|g| g.privileges & p.bits() == p.bits())
+        .fold(0u8, |acc, g| acc | g.privileges);
+    held & p.bits() == p.bits()
 }
 
 /// Confere se `who` pode executar `stmt`; superusuário pode tudo.
