@@ -1534,7 +1534,11 @@ fn mtls_login(
     client: (PrivateKey, Vec<Vec<u8>>),
 ) -> (u16, u16) {
     use mini_db::tls::ClientAuth;
-    let dir = tmpdir("mtls-algo");
+    // Uma pasta por chamada: dois testes em paralelo usam esta função, e o servidor
+    // da chamada anterior continua com o banco aberto.
+    static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = tmpdir(&format!("mtls-algo-{n}"));
     let mut db = Db::open(&dir).unwrap();
     ok(&mut db, "CREATE USER ana PASSWORD 'ana123' SUPERUSER");
     let opts = NetOptions {

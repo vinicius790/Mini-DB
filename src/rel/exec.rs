@@ -4528,8 +4528,7 @@ fn hash_key(v: &Value) -> Vec<u8> {
         other => other.as_f64(),
     };
     match number {
-        Some(x) if x == 0.0 => key_of(&Value::Real(0.0)),
-        Some(x) => key_of(&Value::Real(x)),
+        Some(x) => key_of(&Value::Real(if x == 0.0 { 0.0 } else { x })),
         None => key_of(v),
     }
 }
