@@ -1026,10 +1026,10 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
         portals: HashMap::new(),
         failed: false,
     };
-    let mut skipping = false; // erro no protocolo estendido: ignora até Sync
     // Entrou em modo aberto (sem usuários nem token): se alguém criar o primeiro
     // usuário, a conexão é encerrada e o cliente reconecta autenticando (como no TCP).
     let open_mode = !has_users && opts.token.is_none();
+    let mut skipping = false; // erro no protocolo estendido: ignora até Sync
     loop {
         let (ty, body) = match read_message(&mut ch, MAX_MESSAGE) {
             Ok(m) => m,
