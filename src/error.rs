@@ -28,6 +28,12 @@ pub enum Error {
     Conflict(String),
     /// Escrita recusada: o banco é uma réplica somente leitura.
     ReadOnly,
+    /// Temporariamente indisponível (réplica em ressincronização): HTTP 503.
+    Unavailable(String),
+    /// Credencial ausente ou inválida (token HTTP/TCP): HTTP 401.
+    Unauthorized,
+    /// Autenticado, mas sem privilégio para o comando: HTTP 403.
+    Forbidden(String),
     /// Violação de restrição do SQL relacional (NOT NULL, UNIQUE, PK, tipo).
     Constraint(String),
     Other(String),
@@ -58,6 +64,9 @@ impl fmt::Display for Error {
             Self::InvalidInput(s) => write!(f, "entrada inválida: {s}"),
             Self::Conflict(s) => write!(f, "conflito de escrita (repita a transação): {s}"),
             Self::ReadOnly => write!(f, "banco somente leitura (réplica)"),
+            Self::Unavailable(s) => write!(f, "indisponível no momento: {s}"),
+            Self::Unauthorized => write!(f, "não autorizado: credencial ausente ou inválida"),
+            Self::Forbidden(s) => write!(f, "permissão negada: {s}"),
             Self::Constraint(s) => write!(f, "restrição violada: {s}"),
             Self::Other(s) => write!(f, "{s}"),
         }
@@ -81,6 +90,8 @@ impl Error {
                 | Self::Conflict(_)
                 | Self::ReadOnly
                 | Self::Constraint(_)
+                | Self::Unauthorized
+                | Self::Forbidden(_)
         )
     }
 }

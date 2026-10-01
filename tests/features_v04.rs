@@ -153,7 +153,7 @@ fn batch_is_atomic_across_crash() {
     ]);
     assert!(invalid.is_err());
     db.drop_without_checkpoint();
-    let mut db = Db::open(&dir).unwrap();
+    let db = Db::open(&dir).unwrap();
     let keys: Vec<_> = db
         .scan(b"\0", None)
         .unwrap()
@@ -230,8 +230,9 @@ fn page_stats_track_empty_leaves_and_vacuum() {
 
 #[test]
 fn cli_commands_cover_new_features() {
-    let mut db = Db::open(tmpdir("cli")).unwrap();
-    let mut run = |line: &str| mini_db::cmd::apply(&mut db, line).unwrap();
+    let db = mini_db::mvcc::SharedDb::new(Db::open(tmpdir("cli")).unwrap());
+    let session = std::cell::RefCell::new(db.session());
+    let run = |line: &str| mini_db::cmd::apply(&mut session.borrow_mut(), line).unwrap();
     assert!(run("SETEX s 3600 valor com espaços").starts_with("OK"));
     assert!(run("TTL s").starts_with("ttl_ms="));
     assert_eq!(run("PERSIST s"), "OK\n");

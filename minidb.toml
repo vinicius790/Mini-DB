@@ -1,6 +1,37 @@
 # Configuração padrão (pode copiar para o diretório de dados).
+# Variáveis MINIDB_* (ver src/config.rs) têm prioridade sobre este arquivo.
 path = "./data"
-pool_frames = 64
+pool_frames = 1024
 tcp_addr = "127.0.0.1:7432"
 http_addr = "127.0.0.1:8080"
 fsync = true
+
+# Segurança dos servidores: com token, HTTP exige "Authorization: Bearer <token>"
+# e TCP exige "AUTH <token>" antes de qualquer comando. Com usuários (CREATE USER),
+# valem "Authorization: Basic", "AUTH usuário senha" e SCRAM no protocolo PostgreSQL.
+# token = "troque-por-um-segredo-longo"
+# Protocolo PostgreSQL (psql/drivers); "" desliga. Também MINIDB_PG.
+# pg_addr = "127.0.0.1:5432"
+# TLS 1.3 no protocolo PostgreSQL (tls.key/tls.crt gerados) e HTTPS no servidor HTTP.
+# tls = true
+# https = false
+# PKI própria (minidb cert ca|server|client) e certificado de cliente (mTLS; chaves Ed25519, ECDSA ou RSA, p. ex. da Let's Encrypt):
+# tls_cert = "pki/server.crt"
+# tls_key = "pki/server.key"
+# tls_ca = "pki/ca.crt"
+# tls_client_auth = "required"   # off | optional | required
+# Criptografia em repouso (só em banco novo; exigida em toda abertura). Também MINIDB_PASSPHRASE.
+# passphrase = "senha-longa-do-banco"
+max_connections = 1024
+# max_body_bytes = 135266304
+
+# Replicação: segredo compartilhado (autentica + cifra), réplicas síncronas e
+# WAL retido para réplicas retomarem após checkpoints e reinícios.
+# repl_secret = "outro-segredo-longo"
+sync_replicas = 0
+sync_timeout_ms = 0
+wal_retention_mb = 256
+
+# Manutenção automática: checkpoint pelo tamanho do WAL e purge/vacuum periódicos.
+auto_checkpoint_mb = 64
+maintenance_secs = 60

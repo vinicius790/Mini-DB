@@ -10,7 +10,7 @@ use crate::error::Result;
 pub const KEY_FORMAT: &[u8] = b"__sys/format";
 pub const KEY_SCHEMA_EPOCH: &[u8] = b"__sys/schema_epoch";
 pub const KEY_VALUE_INDEX: &[u8] = b"__sys/value_index";
-pub const FORMAT_VERSION: &[u8] = b"minidb-0.5";
+pub const FORMAT_VERSION: &[u8] = b"minidb-1.1";
 
 pub fn bootstrap(db: &mut Db) -> Result<()> {
     if db.get(KEY_FORMAT)?.is_none() {

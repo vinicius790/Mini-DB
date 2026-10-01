@@ -1,6 +1,7 @@
 """Cliente HTTP de referência para o Mini-DB, apenas com a biblioteca padrão."""
 from __future__ import annotations
 
+import base64
 import json
 import urllib.error
 import urllib.parse
@@ -8,8 +9,22 @@ import urllib.request
 
 
 class MiniDbClient:
-    def __init__(self, base: str = "http://127.0.0.1:8080") -> None:
+    """Com `token`, envia `Authorization: Bearer`; com `username`/`password`, `Basic`."""
+
+    def __init__(
+        self,
+        base: str = "http://127.0.0.1:8080",
+        token: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
         self.base = base.rstrip("/")
+        self._headers = {"Content-Type": "application/json"}
+        if username is not None:
+            raw = f"{username}:{password or ''}".encode()
+            self._headers["Authorization"] = "Basic " + base64.b64encode(raw).decode()
+        elif token is not None:
+            self._headers["Authorization"] = f"Bearer {token}"
 
     def _req(self, method: str, path: str, body=None):
         data = None if body is None else json.dumps(body).encode()
@@ -17,7 +32,7 @@ class MiniDbClient:
             self.base + path,
             data=data,
             method=method,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -137,8 +152,12 @@ class MiniDbClient:
     def pages(self):
         return self._req("GET", "/v1/pages")
 
-    def sql(self, sql: str):
-        return self._req("POST", "/v1/sql", {"sql": sql})
+    def sql(self, sql: str, params: list | None = None):
+        """Executa SQL; `params` (null/bool/número/texto) preenche `?`, `?N` e `$N`."""
+        body = {"sql": sql}
+        if params is not None:
+            body["params"] = params
+        return self._req("POST", "/v1/sql", body)
 
     def metrics(self) -> str:
         return self._req("GET", "/metrics")

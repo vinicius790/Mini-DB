@@ -54,3 +54,17 @@ name = "codec"
 path = "fuzz_targets/codec.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "regex"
+path = "fuzz_targets/regex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509"
+path = "fuzz_targets/x509.rs"
+test = false
+doc = false
+bench = false

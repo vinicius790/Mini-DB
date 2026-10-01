@@ -73,6 +73,8 @@ fn write_json(v: &Json, out: &mut String) {
         Json::Number(n) => out.push_str(&n.to_string()),
         // `Debug` preserva o ponto decimal (`3.0`) e usa expoente em valores
         // extremos (`1e300`), garantindo que o valor volte a ser lido como float.
+        // JSON não tem `inf`/`NaN`: valores não finitos viram `null`.
+        Json::Float(n) if !n.is_finite() => out.push_str("null"),
         Json::Float(n) => out.push_str(&format!("{n:?}")),
         Json::String(s) => {
             out.push('"');

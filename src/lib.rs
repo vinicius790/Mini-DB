@@ -1,9 +1,12 @@
 //! # Mini-DB
 //!
-//! Banco de dados embarcado sem dependências externas: SQL relacional
-//! ([`rel`]), chave-valor com TTL, MVCC ([`mvcc`]), replicação ([`replication`])
-//! e compressão ([`codec`]) sobre páginas de 4 KiB, B+ Tree, buffer pool LRU e
-//! WAL com CRC32 — com adaptadores CLI, TCP, HTTP/JSON e ABI C.
+//! Banco de dados embarcado sem dependências externas: SQL relacional com chaves
+//! estrangeiras, views, funções de janela, CTEs recursivas e transações
+//! ([`rel`], [`mvcc::Session`]), chave-valor com TTL, leitura paralela e
+//! MVCC serializável ([`mvcc`]), replicação cifrada com failover
+//! ([`replication`]), compressão ([`codec`]) e valores de até 64 MiB sobre páginas
+//! de 4 KiB, B+ Tree com overflow, buffer pool e WAL com CRC32 — com adaptadores
+//! CLI, TCP, HTTP/JSON (com token) e ABI C.
 //!
 //! ```
 //! use mini_db::{BatchOp, Db};
@@ -21,7 +24,9 @@
 //! # Ok::<(), mini_db::Error>(())
 //! ```
 
+pub mod auth;
 pub mod backup;
+pub mod bignum;
 pub mod bloom;
 pub mod btree;
 pub mod buffer;
@@ -29,8 +34,13 @@ pub mod catalog;
 pub mod cmd;
 pub mod codec;
 pub mod config;
+pub mod crypto;
+pub mod curve25519;
 pub mod db;
+pub mod ecc;
+pub mod encryption;
 pub mod error;
+pub mod events;
 pub mod ffi;
 pub mod http;
 pub mod index;
@@ -39,13 +49,18 @@ pub mod json;
 pub mod metrics;
 pub mod mvcc;
 pub mod page;
+pub mod pg;
+pub mod pubkey;
 pub mod rel;
 pub mod replica;
 pub mod replication;
+pub mod rsa;
 pub mod server;
 pub mod sql;
+pub mod tls;
 pub mod verify;
 pub mod wal;
+pub mod x509;
 
 pub use config::Config;
 pub use db::RESERVED_PREFIX;

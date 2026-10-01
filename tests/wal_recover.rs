@@ -32,7 +32,7 @@ fn recover_after_crash_without_checkpoint() {
     simulate_crash_after_wal(dir.as_path(), &ops).unwrap();
 
     // data.mdb pode estar sem as páginas dirty; WAL tem os inserts.
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(
         db.get(b"hero").unwrap().as_deref(),
         Some(b"alucard".as_ref())
@@ -60,7 +60,7 @@ fn recover_many_keys_after_crash() {
         // Crash: sem checkpoint / sem flush final.
         db.drop_without_checkpoint();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     for i in 0..80 {
         let k = format!("k{:03}", i);
         let v = format!("v{:03}", i);
@@ -90,7 +90,7 @@ fn truncated_wal_frame_is_ignored() {
     assert!(meta_len > 20);
     truncate_file_at(&wal_path, meta_len - 7).unwrap();
 
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     // "ok" veio do checkpoint (páginas no data.mdb).
     assert_eq!(db.get(b"ok").unwrap().as_deref(), Some(b"1".as_ref()));
     // Frame de "also_ok" foi truncado → ignorado no recover; chave ausente.

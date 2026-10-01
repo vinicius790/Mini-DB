@@ -84,7 +84,7 @@ fn replica_ship_rejects_open_primary() {
     primary.close().unwrap();
     drop(primary);
     ship_snapshot(&src, &dst).unwrap();
-    let mut standby = open_standby(&dst).unwrap();
+    let standby = open_standby(&dst).unwrap();
     assert_eq!(standby.get(b"a").unwrap().as_deref(), Some(b"1".as_ref()));
 }
 

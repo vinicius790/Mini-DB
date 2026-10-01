@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "minidb"
-version = "0.5.0"
+version = "0.7.0"
 
 [[package]]
 name = "minidb-fuzz"

@@ -9,10 +9,20 @@
 *.mdb
 *.mdb.next
 *.mdb.spill
+*.mdb.journal
+*.mdb.convert
+*.mdb.convert.state
+*.mdb.key
+*.mdb.key.old
 *.snapshot.next-*
+wal-archive/
 LOCK
 wal.log
 backup.jsonl
+# Chaves/certificados gerados pelo servidor ou por `minidb cert` (os de teste ficam em tests/fixtures/pki)
+/tls.key
+/tls.crt
+/pki/
 
 # Python
 __pycache__/
@@ -21,3 +31,4 @@ __pycache__/
 # Editor / SO
 .DS_Store
 *.swp
+.vscode/

@@ -40,7 +40,18 @@ cargo +nightly fuzz run sql_parser  -- -max_total_time=60
 cargo +nightly fuzz run json_parser -- -max_total_time=60
 cargo +nightly fuzz run wal_record  -- -max_total_time=60
 cargo +nightly fuzz run page_decode -- -max_total_time=60
+cargo +nightly fuzz run rel_sql     -- -max_total_time=60
+cargo +nightly fuzz run codec       -- -max_total_time=60
 ```
+
+Há também os alvos `regex` (compilar e casar padrões) e `x509` (certificados DER/PEM e
+chaves PEM, que chegam de clientes de rede antes da autenticação). Eles ainda não
+entram no laço do CI: rode-os à mão e, depois de uma primeira rodada limpa, acrescente
+os nomes ao passo de fuzz de `.github/workflows/ci.yml`.
+
+Lacuna conhecida: não há alvo de fuzz para TLS, protocolo PostgreSQL, requisição HTTP,
+quadros de replicação, JSONL e TOML (os decodificadores são privados ao módulo).
+Novos decodificadores devem ganhar caso em `tests/robustness.rs` e alvo em `fuzz/`.
 
 Propriedades: nenhum pânico; JSON aceito sobrevive a `stringify → parse`; corpo de
 WAL aceito é reencodado byte a byte. O teste de robustez estável cobre as mesmas

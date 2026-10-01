@@ -101,7 +101,7 @@ fn garbage_wal_tail_is_ignored_on_open() {
     std::fs::write(Db::wal_path(&dir), &wal).unwrap();
     let (_, records) = Wal::read_all(Db::wal_path(&dir)).unwrap();
     assert!(!records.is_empty());
-    let mut db = Db::open(&dir).unwrap();
+    let db = Db::open(&dir).unwrap();
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_ref()));
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -120,5 +120,36 @@ fn relational_parser_and_codec_never_panic() {
             blob
         );
         let _ = mini_db::codec::decode_value(&blob);
+    }
+}
+
+#[test]
+fn regex_compiler_and_matcher_never_panic() {
+    use mini_db::rel::regex::Regex;
+    let mut rng = Rng(29);
+    let alphabet: &[u8] = b"ab01.*+?|()[]{}^$\\:-,dws alphnum";
+    for _ in 0..ITERS {
+        let raw = rng.bytes(24, alphabet);
+        let pattern = String::from_utf8_lossy(&raw);
+        if let Ok(re) = Regex::new(&pattern, "") {
+            let _ = re.is_match("ab01 ab0");
+        }
+    }
+    // Classe POSIX sem nome já causou pânico (fatia invertida).
+    assert!(Regex::new("[[:]", "").is_err());
+    assert!(Regex::new("[[:alpha:]]+", "").unwrap().is_match("abc"));
+    assert!(!Regex::new("^[[:digit:]]+$", "").unwrap().is_match("abc"));
+}
+
+#[test]
+fn pem_and_certificate_decoders_never_panic() {
+    let mut rng = Rng(31);
+    for _ in 0..ITERS {
+        let raw = rng.bytes(96, &[]);
+        let _ = mini_db::x509::Cert::parse(&raw);
+        let pem = rng.bytes(96, b"-BEGINDCRTFAK \nabc+/=");
+        let text = String::from_utf8_lossy(&pem);
+        let _ = mini_db::x509::pem_all(&text, "CERTIFICATE");
+        let _ = mini_db::pubkey::PrivateKey::from_pem(&text);
     }
 }

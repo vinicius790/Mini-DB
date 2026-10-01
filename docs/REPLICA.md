@@ -19,5 +19,7 @@ da meta. Serve para:
 - teste de recover em outro diretório
 - drill de desastre
 
-Não use como HA em produção sem um ship contínuo + fencing — não está neste repo e está
-explicitamente fora do escopo 0.3.
+Para alta disponibilidade use a replicação contínua (`replication.rs`: streaming
+autenticado e cifrado, semi-síncrona, promoção manual com época e fencing; veja
+[MOTOR-0.6.md](MOTOR-0.6.md)). `ship_snapshot` não abre bancos criptografados nem copia
+`data.mdb.key`: para esses, use `minidb backup`.

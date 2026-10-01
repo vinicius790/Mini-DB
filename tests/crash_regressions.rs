@@ -25,7 +25,7 @@ fn eviction_and_root_splits_survive_repeated_crashes() {
             db.put(key.as_bytes(), &value).unwrap();
         }
         db.drop_without_checkpoint();
-        let mut db = Db::open_with_capacity(&dir, 4).unwrap();
+        let db = Db::open_with_capacity(&dir, 4).unwrap();
         for i in 0..400 {
             assert_eq!(
                 db.get(format!("k{i:04}").as_bytes()).unwrap(),
@@ -55,7 +55,7 @@ fn checkpoint_then_evicted_updates_recover_consistently() {
         }
     }
     db.drop_without_checkpoint();
-    let mut db = Db::open_with_capacity(&dir, 4).unwrap();
+    let db = Db::open_with_capacity(&dir, 4).unwrap();
     for i in 0..200 {
         let want = if i % 3 == 0 { None } else { Some(vec![2; 240]) };
         assert_eq!(
@@ -77,7 +77,7 @@ fn failed_second_open_does_not_change_database() {
     );
     first.close().unwrap();
     drop(first);
-    let mut reopened = Db::open(&dir).unwrap();
+    let reopened = Db::open(&dir).unwrap();
     assert_eq!(
         reopened.get(b"owner").unwrap().as_deref(),
         Some(b"one".as_slice())
@@ -173,7 +173,7 @@ fn committed_transaction_survives_process_exit_without_destructors() {
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(73));
-    let mut db = Db::open_with_capacity(&dir, 4).unwrap();
+    let db = Db::open_with_capacity(&dir, 4).unwrap();
     assert_eq!(db.scan(b"k", None).unwrap().len(), 200);
     for i in 0..200 {
         assert_eq!(

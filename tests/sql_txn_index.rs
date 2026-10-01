@@ -27,7 +27,7 @@ fn delete_and_reopen() {
         assert_eq!(db.get(b"drop").unwrap(), None);
         db.close().unwrap();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(db.get(b"keep").unwrap().as_deref(), Some(b"1".as_ref()));
     assert_eq!(db.get(b"drop").unwrap(), None);
 }
@@ -62,7 +62,7 @@ fn txn_crash_without_commit_is_aborted() {
         // WAL ainda não tem COMMIT; abandonar sem close/checkpoint.
         db.drop_without_checkpoint();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(db.get(b"stable").unwrap().as_deref(), Some(b"s".as_ref()));
     // ghost só existia no write-set em memória — sem BEGIN no WAL se rollback...
     // begin() não grava WAL até commit(). Logo ghost some. Correto.

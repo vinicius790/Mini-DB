@@ -1,6 +1,7 @@
 # Escopo fechado do Mini-DB 0.3
 
-> Documento histórico. O escopo vigente está em [ESCOPO-0.4.md](ESCOPO-0.4.md).
+> Documento histórico. O estado atual está no [README](../README.md) e no
+> [CHANGELOG](../CHANGELOG.md).
 
 Este documento define o que significa "concluído" para a versão 0.3. O projeto é um
 motor KV embutido didático, não um SGBD distribuído de produção.

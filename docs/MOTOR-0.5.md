@@ -1,5 +1,8 @@
 # Motor 0.5: SQL relacional, MVCC, replicação e compressão
 
+> Documento histórico: os limites citados aqui foram superados na 0.6
+> ([MOTOR-0.6.md](MOTOR-0.6.md)) e o SQL cresceu muito desde então ([SQL.md](SQL.md)).
+
 A 0.5 transforma o Mini-DB de um armazenamento chave-valor em um banco relacional
 embarcado sem acrescentar dependências nem um segundo formato de arquivo. As quatro
 peças novas se apoiam no mesmo ponto: **o commit único** (`Db::log_and_apply`), que

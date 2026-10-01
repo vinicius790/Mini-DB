@@ -18,7 +18,7 @@ pub fn dump_meta(meta: &MetaInfo) -> String {
     )
 }
 
-pub fn dump_page(pool: &mut BufferPool, page_id: u32) -> Result<String> {
+pub fn dump_page(pool: &BufferPool, page_id: u32) -> Result<String> {
     let page = pool.get_page(page_id)?;
     let mut out = String::new();
     out.push_str(&format!(
@@ -32,14 +32,22 @@ pub fn dump_page(pool: &mut BufferPool, page_id: u32) -> Result<String> {
     match page.kind() {
         PageKind::Leaf => {
             for i in 0..page.n_slots() as usize {
-                let (k, v) = page.leaf_cell(i);
-                out.push_str(&format!(
-                    "  leaf[{i}] key={} value_len={}\n",
-                    escape(k),
-                    v.len()
-                ));
+                let (k, v, overflow) = page.leaf_entry(i);
+                let value = if overflow {
+                    let total = u32::from_le_bytes(v[0..4].try_into().expect("ponteiro"));
+                    let first = u32::from_le_bytes(v[4..8].try_into().expect("ponteiro"));
+                    format!("overflow total={total} first_page={first}")
+                } else {
+                    format!("value_len={}", v.len())
+                };
+                out.push_str(&format!("  leaf[{i}] key={} {value}\n", escape(k)));
             }
         }
+        PageKind::Overflow => out.push_str(&format!(
+            "  overflow bytes={} next={}\n",
+            page.overflow_data().len(),
+            page.right_sibling()
+        )),
         PageKind::Internal => {
             out.push_str(&format!("  leftmost={}\n", page.leftmost_child()));
             for i in 0..page.n_slots() as usize {
@@ -48,13 +56,12 @@ pub fn dump_page(pool: &mut BufferPool, page_id: u32) -> Result<String> {
             }
         }
         PageKind::Meta => out.push_str("  (meta payload)\n"),
-        _ => {}
+        PageKind::Free => out.push_str(&format!("  free next={}\n", page.right_sibling())),
     }
-    pool.unpin(page_id);
     Ok(out)
 }
 
-pub fn hexdump_page(pool: &mut BufferPool, page_id: u32, bytes: usize) -> Result<String> {
+pub fn hexdump_page(pool: &BufferPool, page_id: u32, bytes: usize) -> Result<String> {
     let page = pool.get_page(page_id)?;
     let n = bytes.min(PAGE_SIZE);
     let mut out = String::new();
@@ -77,7 +84,6 @@ pub fn hexdump_page(pool: &mut BufferPool, page_id: u32, bytes: usize) -> Result
         }
         out.push('\n');
     }
-    pool.unpin(page_id);
     Ok(out)
 }
 
@@ -104,6 +110,8 @@ pub struct PageStats {
     pub empty_leaves: u32,
     pub internals: u32,
     pub free_pages: u32,
+    /// Páginas com pedaços de valores grandes.
+    pub overflow_pages: u32,
     /// Bytes ocupados por células e slots nas páginas de árvore.
     pub live_bytes: u64,
     /// `live_bytes` sobre a área útil das páginas de árvore, em %.
@@ -116,12 +124,13 @@ impl std::fmt::Display for PageStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pages={} leaves={} empty_leaves={} internals={} free={} live_bytes={} fill={}% height={}",
+            "pages={} leaves={} empty_leaves={} internals={} free={} overflow={} live_bytes={} fill={}% height={}",
             self.total_pages,
             self.leaves,
             self.empty_leaves,
             self.internals,
             self.free_pages,
+            self.overflow_pages,
             self.live_bytes,
             self.fill_percent,
             self.height
@@ -129,7 +138,7 @@ impl std::fmt::Display for PageStats {
     }
 }
 
-pub fn page_stats(pool: &mut BufferPool, meta: &MetaInfo) -> Result<PageStats> {
+pub fn page_stats(pool: &BufferPool, meta: &MetaInfo) -> Result<PageStats> {
     let mut s = PageStats {
         total_pages: meta.next_page_id,
         ..PageStats::default()
@@ -143,7 +152,7 @@ pub fn page_stats(pool: &mut BufferPool, meta: &MetaInfo) -> Result<PageStats> {
                 s.empty_leaves += u32::from(n == 0);
                 s.live_bytes += (0..n)
                     .map(|i| {
-                        let (k, v) = page.leaf_cell(i);
+                        let (k, v, _) = page.leaf_entry(i);
                         (6 + k.len() + v.len()) as u64
                     })
                     .sum::<u64>();
@@ -155,9 +164,9 @@ pub fn page_stats(pool: &mut BufferPool, meta: &MetaInfo) -> Result<PageStats> {
                     .sum::<u64>();
             }
             PageKind::Free => s.free_pages += 1,
+            PageKind::Overflow => s.overflow_pages += 1,
             PageKind::Meta => {}
         }
-        pool.unpin(id);
     }
     let area = u64::from(s.leaves + s.internals) * (PAGE_SIZE - PAGE_HEADER_SIZE) as u64;
     s.fill_percent = (s.live_bytes * 100).checked_div(area).unwrap_or(0) as u32;
@@ -165,7 +174,6 @@ pub fn page_stats(pool: &mut BufferPool, meta: &MetaInfo) -> Result<PageStats> {
     loop {
         let page = pool.get_page(id)?;
         let (kind, child) = (page.kind(), page.leftmost_child());
-        pool.unpin(id);
         s.height += 1;
         if kind != PageKind::Internal || s.height > 64 {
             break;

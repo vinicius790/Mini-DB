@@ -4,7 +4,8 @@
 //! `META_FLAG_COMPRESSED_VALUES`):
 //!
 //! - `[0x00][bytes]` — valor cru (não comprimiu o suficiente);
-//! - `[0x01][len:u16 LE][tokens]` — valor comprimido com `len` bytes lógicos.
+//! - `[0x01][len:u16 LE][tokens]` — valor comprimido com até 64 KiB lógicos;
+//! - `[0x02][len:u32 LE][tokens]` — valor comprimido maior (até o limite de valor).
 //!
 //! Tokens: `c < 0x80` = literal de `c + 1` bytes; `c >= 0x80` = cópia de
 //! `(c & 0x7f) + MIN_MATCH` bytes a partir do offset `u16 LE` (1..=65535).
@@ -14,6 +15,7 @@ use crate::error::{Error, Result};
 
 const TAG_RAW: u8 = 0;
 const TAG_LZ: u8 = 1;
+const TAG_LZ32: u8 = 2;
 const MIN_MATCH: usize = 4;
 const MAX_MATCH: usize = 0x7f + MIN_MATCH;
 const MAX_LITERAL: usize = 0x80;
@@ -65,6 +67,9 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
 /// Descomprime tokens LZ exigindo exatamente `expected` bytes de saída.
 pub fn decompress(tokens: &[u8], expected: usize) -> Result<Vec<u8>> {
     let bad = || Error::Other("valor comprimido corrompido".into());
+    if expected > crate::page::MAX_VALUE_LEN {
+        return Err(bad());
+    }
     let mut out = Vec::with_capacity(expected);
     let mut i = 0;
     while i < tokens.len() {
@@ -101,10 +106,17 @@ pub fn decompress(tokens: &[u8], expected: usize) -> Result<Vec<u8>> {
 pub fn encode_value(value: &[u8]) -> Vec<u8> {
     if value.len() >= MIN_INPUT {
         let tokens = compress(value);
-        if tokens.len() + 3 < value.len() + 1 {
-            let mut out = Vec::with_capacity(tokens.len() + 3);
-            out.push(TAG_LZ);
-            out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        let small = value.len() <= u16::MAX as usize;
+        let header = if small { 3 } else { 5 };
+        if tokens.len() + header < value.len() + 1 {
+            let mut out = Vec::with_capacity(tokens.len() + header);
+            if small {
+                out.push(TAG_LZ);
+                out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            } else {
+                out.push(TAG_LZ32);
+                out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            }
             out.extend_from_slice(&tokens);
             return out;
         }
@@ -122,6 +134,10 @@ pub fn decode_value(stored: &[u8]) -> Result<Vec<u8>> {
         Some((&TAG_LZ, rest)) if rest.len() >= 2 => {
             decompress(&rest[2..], u16::from_le_bytes([rest[0], rest[1]]) as usize)
         }
+        Some((&TAG_LZ32, rest)) if rest.len() >= 4 => decompress(
+            &rest[4..],
+            u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize,
+        ),
         _ => Err(Error::Other("tag de valor armazenado inválida".into())),
     }
 }
@@ -144,6 +160,11 @@ mod tests {
         for v in [&b""[..], b"a", b"curto", &[7u8; 1024][..]] {
             assert_eq!(decode_value(&encode_value(v)).unwrap(), v);
         }
+        // Acima de 64 KiB o cabeçalho usa u32.
+        let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let enc = encode_value(&big);
+        assert_eq!(enc[0], TAG_LZ32);
+        assert_eq!(decode_value(&enc).unwrap(), big);
     }
 
     #[test]

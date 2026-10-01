@@ -6,7 +6,7 @@ Endianness: little-endian. Magic: `MDB1`.
 offset  size  campo
 0       4     magic
 4       4     page_id
-8       1     kind   0=Free 1=Meta 2=Internal 3=Leaf
+8       1     kind   0=Free 1=Meta 2=Internal 3=Leaf 4=Overflow
 9       1     flags
 10      2     n_slots
 12      2     cell_end
@@ -40,4 +40,9 @@ Checksum: CRC16-CCITT-FALSE (poly 0x1021, init 0xFFFF; vetor `"123456789"` →
 
 Compatibilidade: arquivos 0.3 abrem na 0.4 sem migração (`ttl_root` = 0).
 
-Limites: chave ≤ 128 B, valor ≤ 1024 B.
+Limites (0.6): chave ≤ 1 KiB (chaves internas de índice ≤ 1088 B), valor ≤ 64 MiB.
+Nenhuma célula passa de 1/3 da página (1352 B + slot); valores maiores vão para
+páginas `Overflow` (tipo 4): a célula guarda `[total:u32][primeira:u32]` com o bit 15
+de `val_len` ligado, e cada página de overflow usa `right_sibling` como próxima e
+`extra` como bytes úteis. Páginas liberadas entram na freelist (`freelist_head`).
+Flags da meta: `1` índice por valor, `2` valores comprimidos, `4` índice por hash.

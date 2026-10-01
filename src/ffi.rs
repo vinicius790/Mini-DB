@@ -115,7 +115,8 @@ pub unsafe extern "C" fn minidb_put_bytes(
     } else {
         unsafe { std::slice::from_raw_parts(value, value_len) }
     };
-    if crate::btree::validate_key(key).is_err() || crate::btree::validate_value(value).is_err() {
+    if crate::btree::validate_user_key(key).is_err() || crate::btree::validate_value(value).is_err()
+    {
         return -1;
     }
     match db.put(key, value) {
@@ -140,7 +141,7 @@ pub unsafe extern "C" fn minidb_get(
         return -1;
     }
     let k = unsafe { CStr::from_ptr(key) }.to_bytes();
-    if crate::btree::validate_key(k).is_err() {
+    if crate::btree::validate_user_key(k).is_err() {
         return -1;
     }
     let result = minidb_get_bytes(
@@ -171,7 +172,7 @@ pub unsafe extern "C" fn minidb_get_size(handle: *mut Db, key: *const u8, key_le
         return -1;
     }
     let key = unsafe { std::slice::from_raw_parts(key, key_len) };
-    if crate::btree::validate_key(key).is_err() {
+    if crate::btree::validate_user_key(key).is_err() {
         return -1;
     }
     match db.get(key) {
@@ -196,7 +197,7 @@ pub unsafe extern "C" fn minidb_exists(handle: *mut Db, key: *const u8, key_len:
         return -1;
     }
     let key = unsafe { std::slice::from_raw_parts(key, key_len) };
-    if crate::btree::validate_key(key).is_err() {
+    if crate::btree::validate_user_key(key).is_err() {
         return -1;
     }
     match db.get(key) {
@@ -227,7 +228,7 @@ pub unsafe extern "C" fn minidb_get_bytes(
         return -1;
     }
     let key = unsafe { std::slice::from_raw_parts(key, key_len) };
-    if crate::btree::validate_key(key).is_err() {
+    if crate::btree::validate_user_key(key).is_err() {
         return -1;
     }
     match db.get(key) {
@@ -258,7 +259,7 @@ pub unsafe extern "C" fn minidb_delete(handle: *mut Db, key: *const c_char) -> c
         return -1;
     }
     let k = unsafe { CStr::from_ptr(key) }.to_bytes();
-    if crate::btree::validate_key(k).is_err() {
+    if crate::btree::validate_user_key(k).is_err() {
         return -1;
     }
     match db.delete(k) {

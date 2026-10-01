@@ -1,0 +1,8 @@
+target
+fuzz/target
+.git
+data
+dist
+tmp
+*.mdb
+wal.log

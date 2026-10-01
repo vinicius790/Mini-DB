@@ -62,7 +62,7 @@ fn reopen_after_clean_close() {
         db.put(b"persist", b"yes").unwrap();
         db.close().unwrap();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(
         db.get(b"persist").unwrap().as_deref(),
         Some(b"yes".as_ref())
