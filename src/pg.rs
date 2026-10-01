@@ -573,6 +573,7 @@ impl Conn<'_> {
         result
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn send_result(&self, w: &mut impl Write, result: ExecResult, describe: bool) -> Result<()> {
         let result = tabular(result);
         match &result {

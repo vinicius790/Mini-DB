@@ -3,14 +3,18 @@ use mini_db::{BatchOp, Db, ExecResult, KeyTtl};
 use std::thread::sleep;
 use std::time::Duration;
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-v04-{tag}-{}-{}",
+        "minidb-v04-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&p).unwrap();
     p

@@ -1,14 +1,18 @@
 use mini_db::Db;
 use std::{fs, path::PathBuf};
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn dir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-regression-{tag}-{}-{}",
+        "minidb-regression-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::create_dir_all(&p).unwrap();
     p
