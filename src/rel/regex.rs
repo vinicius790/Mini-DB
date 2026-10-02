@@ -401,7 +401,8 @@ impl Compiler {
     /// contador (sem desenrolar, para que `(ab){1000000}` não gaste memória).
     fn repeat(&mut self, inner: &Node, min: usize, max: Option<usize>, greedy: bool) {
         if let Some(atom) = single(inner) {
-            self.prog.push(Inst::RepOne(Box::new(atom), min, max, greedy));
+            self.prog
+                .push(Inst::RepOne(Box::new(atom), min, max, greedy));
             return;
         }
         let (count, start) = (self.regs, self.regs + 1);

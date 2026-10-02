@@ -2180,6 +2180,80 @@ fn rename_in_sql(sql: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// O texto menciona `word` como identificador (fora de literais de texto)?
+fn mentions_word(sql: &str, word: &str) -> bool {
+    // Trocar a palavra por nada só muda o texto se ela aparece.
+    rename_in_sql(sql, word, "") != sql
+}
+
+/// O comando lê ou escreve a tabela `table`?
+fn stmt_uses(stmt: &Stmt, table: &str) -> bool {
+    match auth::required(stmt) {
+        auth::Requirement::Privileges(need) => need.iter().any(|(o, _)| o == table),
+        _ => false,
+    }
+}
+
+fn sql_uses(sql: &str, table: &str) -> bool {
+    matches!(super::parser::parse(sql), Ok((stmt, _)) if stmt_uses(&stmt, table))
+}
+
+/// O gatilho `tr` (guardado como texto) depende de `table` ou, com `column`,
+/// do nome dessa coluna?
+fn trigger_uses(tr: &TriggerDef, table: &str, column: Option<&str>) -> bool {
+    let own = tr.table == table;
+    if let (TriggerEvent::Update(cols), Some(c)) = (&tr.event, column) {
+        if own && cols.iter().any(|x| x.eq_ignore_ascii_case(c)) {
+            return true;
+        }
+    }
+    let mut texts: Vec<&str> = tr.body.iter().map(|(s, _)| s.as_str()).collect();
+    texts.extend(tr.when.iter().map(|(_, s)| s.as_str()));
+    let named = |s: &str| column.is_none_or(|c| mentions_word(s, c));
+    let reads = tr.body.iter().any(|(_, s)| stmt_uses(s, table));
+    let relevant = reads || (own && column.is_some());
+    relevant && texts.into_iter().any(named)
+}
+
+/// Primeiro objeto (view, view materializada ou gatilho) cujo SQL guardado usa
+/// `table` e, com `column`, também o nome dessa coluna.
+fn dependent_of(src: &dyn Source, table: &str, column: Option<&str>) -> Result<Option<String>> {
+    let named = |sql: &str| column.is_none_or(|c| mentions_word(sql, c));
+    for v in super::exec::list_views(src)? {
+        if named(&v.sql) && sql_uses(&v.sql, table) {
+            return Ok(Some(format!("pela view {}", v.name)));
+        }
+    }
+    for other in list_tables(src)? {
+        if let TableKind::Materialized { sql, .. } = &other.kind {
+            if other.name != table && named(sql) && sql_uses(sql, table) {
+                return Ok(Some(format!("pela view materializada {}", other.name)));
+            }
+        }
+        for tr in &other.triggers {
+            if trigger_uses(tr, table, column) {
+                return Ok(Some(format!("pelo gatilho {}", tr.name)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Views e gatilhos guardam SQL em texto e o `RENAME` não o reescreve: se algum
+/// depende do nome, recusa em vez de deixá-lo apontando para algo que sumiu.
+fn ensure_unreferenced(src: &dyn Source, table: &str, column: Option<&str>) -> Result<()> {
+    let Some(dep) = dependent_of(src, table, column)? else {
+        return Ok(());
+    };
+    let what = match column {
+        Some(c) => format!("a coluna {table}.{c}"),
+        None => format!("a tabela {table}"),
+    };
+    Err(Error::Sql(format!(
+        "{what} é usada {dep}; apague a dependência e recrie-a depois de renomear"
+    )))
+}
+
 fn rename_column(
     src: &dyn Source,
     pending: &Pending,
@@ -2192,6 +2266,7 @@ fn rename_column(
     if t.column(to).is_ok() {
         return Err(Error::Sql(format!("coluna {to} já existe")));
     }
+    ensure_unreferenced(src, &t.name, Some(from))?;
     t.columns[c].name = to.to_string();
     for check in &mut t.checks {
         check.sql = rename_in_sql(&check.sql, from, to);
@@ -2236,6 +2311,7 @@ fn rename_table(src: &dyn Source, pending: &Pending, table: &str, to: &str) -> R
     if let Some(kind) = name_in_use(src, to)? {
         return Err(Error::Sql(format!("{kind} {to} já existe")));
     }
+    ensure_unreferenced(src, &t.name, None)?;
     for mut child in list_tables(src)? {
         if child.name == t.name {
             continue;
@@ -2254,6 +2330,20 @@ fn rename_table(src: &dyn Source, pending: &Pending, table: &str, to: &str) -> R
     for fk in &mut t.fks {
         if fk.parent == t.name {
             fk.parent = to.to_string();
+        }
+    }
+    // Os privilégios acompanham a tabela. Os que já estavam no nome novo são de
+    // uma tabela apagada: não podem passar para esta.
+    for mut p in auth::list(src)? {
+        let before = p.grants.clone();
+        p.grants.retain(|g| g.object != to);
+        for g in &mut p.grants {
+            if g.object == t.name {
+                g.object = to.to_string();
+            }
+        }
+        if p.grants != before {
+            pending.put(auth::key(&p.name), p.to_json().stringify().into_bytes());
         }
     }
     if let Some(stats) = src.get(&stats_key(&t.name))? {

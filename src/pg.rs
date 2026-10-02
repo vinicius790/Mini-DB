@@ -7,9 +7,10 @@
 //! protocolo estendido (Parse/Bind/Describe/Execute/Sync/Close). Resultados vão
 //! em formato texto; parâmetros chegam em texto ou binário (inteiros, reais,
 //! booleanos e texto). Comandos de sessão dos clientes (`SET`, `SHOW x`,
-//! `RESET`, `DISCARD`, `DEALLOCATE`) são aceitos como no-op.
+//! `RESET`, `DISCARD`, `DEALLOCATE`) são aceitos como no-op. `COPY ... FROM STDIN` e
+//! `COPY ... TO STDOUT` (formato texto) valem na consulta simples.
 
-use crate::auth::{self, ScramServer};
+use crate::auth::{self, Privilege, ScramServer};
 use crate::config::NetOptions;
 use crate::db::ExecResult;
 use crate::error::{Error, Result};
@@ -807,12 +808,611 @@ impl Conn<'_> {
                 w.flush()?;
                 Ok(())
             }
-            b'd' | b'c' | b'f' => Err(Error::Sql("COPY não é suportado".into())),
+            // Como o PostgreSQL: CopyData/CopyDone/CopyFail fora de um COPY são ignorados.
+            b'd' | b'c' | b'f' => Ok(()),
             other => Err(Error::Server(format!(
                 "mensagem {:?} inesperada",
                 other as char
             ))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COPY (formato texto)
+// ---------------------------------------------------------------------------
+
+/// Teto dos bytes de dados de um `COPY ... FROM STDIN` (ficam em memória até o `CopyDone`).
+const MAX_COPY_BYTES: usize = 256 << 20;
+/// Teto de linhas de um `COPY ... FROM STDIN`.
+const MAX_COPY_ROWS: usize = 1_000_000;
+/// Linhas por `INSERT` gerado pelo `COPY ... FROM STDIN`.
+const COPY_CHUNK: usize = 500;
+
+enum CopyTarget {
+    Table(String, Vec<String>),
+    Query(String),
+}
+
+struct CopyOpts {
+    delim: u8,
+    null: String,
+}
+
+struct CopySpec {
+    target: CopyTarget,
+    copy_in: bool,
+    opts: CopyOpts,
+}
+
+impl CopySpec {
+    fn table(&self) -> &str {
+        match &self.target {
+            CopyTarget::Table(name, _) => name,
+            CopyTarget::Query(_) => "",
+        }
+    }
+}
+
+enum CopyTok {
+    Word(String),
+    Ident(String),
+    Str(String),
+    Sym(char),
+}
+
+type Fields = Vec<Option<String>>;
+
+fn bad(msg: &str) -> Error {
+    Error::Sql(format!("COPY: {msg}"))
+}
+
+fn is_word(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// A consulta simples é um `COPY` (sozinho: não vale junto de outros comandos).
+fn is_copy(sql: &str) -> bool {
+    let s = sql.trim_start();
+    let head = s.get(..4).unwrap_or("");
+    head.eq_ignore_ascii_case("copy") && !s[4..].starts_with(is_word)
+}
+
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+fn quote_list(cols: &[String]) -> String {
+    let names: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+    names.join(", ")
+}
+
+fn copy_tokens(s: &str) -> Result<Vec<CopyTok>> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            let mut text = String::new();
+            loop {
+                match chars.get(i) {
+                    None => return Err(bad("texto sem aspas de fechamento")),
+                    Some(&q) if q == c && chars.get(i + 1) == Some(&c) => {
+                        text.push(c);
+                        i += 2;
+                    }
+                    Some(&q) if q == c => {
+                        i += 1;
+                        break;
+                    }
+                    Some(&x) => {
+                        text.push(x);
+                        i += 1;
+                    }
+                }
+            }
+            out.push(if c == '\'' {
+                CopyTok::Str(text)
+            } else {
+                CopyTok::Ident(text)
+            });
+        } else if is_word(c) {
+            let start = i - 1;
+            while i < chars.len() && is_word(chars[i]) {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            out.push(CopyTok::Word(word.to_ascii_lowercase()));
+        } else {
+            out.push(CopyTok::Sym(c));
+        }
+    }
+    Ok(out)
+}
+
+/// Posição do `)` que fecha um `(` já consumido, ignorando o que está entre aspas.
+fn close_paren(s: &str) -> Option<usize> {
+    let mut depth = 1;
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            (None, _) => {}
+        }
+    }
+    None
+}
+
+fn copy_name(tok: Option<CopyTok>) -> Result<String> {
+    match tok {
+        Some(CopyTok::Word(s) | CopyTok::Ident(s)) => Ok(s),
+        _ => Err(bad("esperava um identificador")),
+    }
+}
+
+/// `[WITH] [(] FORMAT text, DELIMITER 'x', NULL 'x' [)]` (CSV e BINARY: não suportados).
+fn parse_copy_opts(toks: Vec<CopyTok>) -> Result<CopyOpts> {
+    let mut it = toks.into_iter().peekable();
+    let _ = it.next_if(|t| matches!(t, CopyTok::Word(w) if w == "with"));
+    let paren = it.next_if(|t| matches!(t, CopyTok::Sym('('))).is_some();
+    let mut closed = !paren;
+    let (mut delim, mut null) = (None, None);
+    while let Some(tok) = it.next() {
+        let name = match tok {
+            CopyTok::Word(w) => w,
+            CopyTok::Sym(',') if paren => continue,
+            CopyTok::Sym(')') if paren => {
+                closed = true;
+                break;
+            }
+            _ => return Err(bad("opção inválida")),
+        };
+        match name.as_str() {
+            "format" => match it.next() {
+                Some(CopyTok::Word(f)) if f == "text" => {}
+                _ => return Err(bad("só FORMAT text (sem CSV/BINARY)")),
+            },
+            "delimiter" | "null" => {
+                let _ = it.next_if(|t| matches!(t, CopyTok::Word(w) if w == "as"));
+                let Some(CopyTok::Str(v)) = it.next() else {
+                    return Err(bad("DELIMITER/NULL querem um texto"));
+                };
+                match name.as_str() {
+                    "delimiter" => delim = Some(v),
+                    _ => null = Some(v),
+                }
+            }
+            _ => return Err(Error::Sql(format!("COPY: opção {name} não suportada"))),
+        }
+    }
+    if !closed || it.next().is_some() {
+        return Err(bad("opções mal formadas"));
+    }
+    let delim = match delim {
+        None => b'\t',
+        Some(s) if s.len() == 1 && s.is_ascii() => s.as_bytes()[0],
+        Some(_) => return Err(bad("DELIMITER: um caractere ASCII")),
+    };
+    if matches!(delim, b'\n' | b'\r' | b'\\') {
+        return Err(bad("DELIMITER inválido"));
+    }
+    let null = null.unwrap_or_else(|| "\\N".to_string());
+    Ok(CopyOpts { delim, null })
+}
+
+/// `COPY tabela [(colunas)] FROM STDIN|TO STDOUT [opções]` e `COPY (consulta) TO STDOUT`.
+fn parse_copy(sql: &str) -> Result<CopySpec> {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    let rest = sql.get(4..).unwrap_or("").trim_start();
+    let (query, toks) = match rest.strip_prefix('(') {
+        Some(inner) => {
+            let Some(end) = close_paren(inner) else {
+                return Err(bad("parênteses sem fechamento"));
+            };
+            let query = inner[..end].trim().to_string();
+            (Some(query), copy_tokens(&inner[end + 1..])?)
+        }
+        None => (None, copy_tokens(rest)?),
+    };
+    let mut it = toks.into_iter().peekable();
+    let target = match query {
+        Some(q) => CopyTarget::Query(q),
+        None => {
+            let name = copy_name(it.next())?;
+            let mut columns = Vec::new();
+            if it.next_if(|t| matches!(t, CopyTok::Sym('('))).is_some() {
+                loop {
+                    columns.push(copy_name(it.next())?);
+                    match it.next() {
+                        Some(CopyTok::Sym(',')) => {}
+                        Some(CopyTok::Sym(')')) => break,
+                        _ => return Err(bad("lista de colunas inválida")),
+                    }
+                }
+            }
+            CopyTarget::Table(name, columns)
+        }
+    };
+    let copy_in = match it.next() {
+        Some(CopyTok::Word(w)) if w == "from" => true,
+        Some(CopyTok::Word(w)) if w == "to" => false,
+        _ => return Err(bad("esperava FROM ou TO")),
+    };
+    let channel = if copy_in { "stdin" } else { "stdout" };
+    if !matches!(it.next(), Some(CopyTok::Word(w)) if w == channel) {
+        return Err(bad("só STDIN/STDOUT (sem arquivo/PROGRAM)"));
+    }
+    if copy_in && matches!(target, CopyTarget::Query(_)) {
+        return Err(bad("(consulta) só vale com TO STDOUT"));
+    }
+    let opts = parse_copy_opts(it.collect())?;
+    Ok(CopySpec {
+        target,
+        copy_in,
+        opts,
+    })
+}
+
+/// Campo do formato texto → bytes escapados (`\\ \n \r \t \b \f \v` e o delimitador).
+fn text_field(s: &str, delim: u8, out: &mut Vec<u8>) {
+    for &b in s.as_bytes() {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            8 => out.extend_from_slice(b"\\b"),
+            11 => out.extend_from_slice(b"\\v"),
+            12 => out.extend_from_slice(b"\\f"),
+            _ if b == delim => out.extend_from_slice(&[b'\\', b]),
+            _ => out.push(b),
+        }
+    }
+}
+
+/// Uma linha do `COPY ... TO STDOUT` (terminada em `\n`).
+fn copy_line(fields: &[Option<String>], opts: &CopyOpts) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(opts.delim);
+        }
+        match field {
+            None => out.extend_from_slice(opts.null.as_bytes()),
+            Some(s) => text_field(s, opts.delim, &mut out),
+        }
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Inverso de `text_field`: escapes, octal (`\101`) e hexadecimal (`\x41`).
+fn text_unescape(f: &[u8]) -> Result<String> {
+    let mut out = Vec::with_capacity(f.len());
+    let mut i = 0;
+    while i < f.len() {
+        let b = f[i];
+        i += 1;
+        if b != b'\\' || i >= f.len() {
+            out.push(b);
+            continue;
+        }
+        let c = f[i];
+        i += 1;
+        match c {
+            b'b' => out.push(8),
+            b'f' => out.push(12),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(11),
+            b'0'..=b'7' => {
+                let mut v = u32::from(c - b'0');
+                let mut n = 1;
+                while n < 3 && i < f.len() && matches!(f[i], b'0'..=b'7') {
+                    v = v * 8 + u32::from(f[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push(v as u8);
+            }
+            b'x' if i < f.len() && f[i].is_ascii_hexdigit() => {
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 2 && i < f.len() && f[i].is_ascii_hexdigit() {
+                    v = v * 16 + char::from(f[i]).to_digit(16).unwrap_or(0);
+                    i += 1;
+                    n += 1;
+                }
+                out.push(v as u8);
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8(out).map_err(|_| bad("dados não são UTF-8 válido"))
+}
+
+struct CopyRows<'a> {
+    data: &'a [u8],
+    pos: usize,
+    line: usize,
+    opts: &'a CopyOpts,
+}
+
+impl CopyRows<'_> {
+    /// Próxima linha como campos (`None` = NULL), conferindo `width` colunas;
+    /// `Ok(None)` no fim dos dados (fim do texto ou linha `\.`).
+    fn next_row(&mut self, width: usize) -> Result<Option<Fields>> {
+        let data = self.data;
+        let rest = &data[self.pos..];
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        if rest.starts_with(b"\\.") && matches!(rest.get(2), None | Some(b'\n' | b'\r')) {
+            self.pos = data.len();
+            return Ok(None);
+        }
+        self.line += 1;
+        let nl = rest.iter().position(|&b| b == b'\n');
+        let end = nl.unwrap_or(rest.len());
+        self.pos += (end + 1).min(rest.len());
+        let line = &rest[..end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // Separa nos delimitadores sem escape (a barra invertida protege o próximo byte).
+        let mut raw = Vec::new();
+        let (mut start, mut i) = (0, 0);
+        while i < line.len() {
+            if line[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if line[i] == self.opts.delim {
+                raw.push(&line[start..i]);
+                start = i + 1;
+            }
+            i += 1;
+        }
+        raw.push(&line[start..]);
+        if raw.len() != width {
+            let (n, got) = (self.line, raw.len());
+            let msg = format!("linha {n}: esperava {width} coluna(s), veio {got}");
+            return Err(bad(&msg));
+        }
+        let null = self.opts.null.as_bytes();
+        let mut fields = Vec::with_capacity(width);
+        for f in raw {
+            if f == null {
+                fields.push(None);
+            } else {
+                fields.push(Some(text_unescape(f)?));
+            }
+        }
+        Ok(Some(fields))
+    }
+}
+
+/// `CopyInResponse` ('G') ou `CopyOutResponse` ('H'): formato texto em todas as colunas.
+fn copy_response(w: &mut impl Write, ty: u8, width: usize) -> Result<()> {
+    let mut body = vec![0u8];
+    body.extend_from_slice(&(width as u16).to_be_bytes());
+    for _ in 0..width {
+        body.extend_from_slice(&0u16.to_be_bytes());
+    }
+    send(w, ty, &body)
+}
+
+/// `($1, $2, ...)` da linha `row` de um `INSERT` com `width` colunas.
+fn placeholders(row: usize, width: usize) -> String {
+    let first = row * width + 1;
+    let items: Vec<String> = (first..first + width).map(|i| format!("${i}")).collect();
+    format!("({})", items.join(", "))
+}
+
+/// Recebe os `CopyData` de um `COPY ... FROM STDIN` até `CopyDone`/`CopyFail`.
+/// Erro externo: conexão perdida; `Ok(Err(_))`: COPY recusado (o fluxo foi lido até o fim,
+/// como no PostgreSQL, para a conexão seguir válida).
+fn copy_receive(ch: &mut Chan) -> Result<Result<Vec<u8>>> {
+    let mut data = Vec::new();
+    let mut failure: Option<Error> = None;
+    loop {
+        let (ty, body) = read_message(ch, MAX_MESSAGE)?;
+        match ty {
+            b'd' if failure.is_none() => {
+                if data.len() + body.len() > MAX_COPY_BYTES {
+                    data = Vec::new();
+                    failure = Some(bad("dados passaram de 256 MiB"));
+                } else {
+                    data.extend_from_slice(&body);
+                }
+            }
+            b'd' | b'S' => {}
+            b'c' => break,
+            b'f' => {
+                let mut pos = 0;
+                let why = take_cstr(&body, &mut pos).unwrap_or_default();
+                if failure.is_none() {
+                    failure = Some(bad(&format!("cancelado pelo cliente: {why}")));
+                }
+                break;
+            }
+            b'H' => ch.flush()?,
+            b'X' => return Err(Error::Io(io::ErrorKind::UnexpectedEof.into())),
+            other => {
+                if failure.is_none() {
+                    let msg = format!("mensagem {:?} inesperada", other as char);
+                    failure = Some(bad(&msg));
+                }
+            }
+        }
+    }
+    Ok(match failure {
+        Some(e) => Err(e),
+        None => Ok(data),
+    })
+}
+
+impl Conn<'_> {
+    /// `COPY` na consulta simples. Erros do comando viram `ErrorResponse` e a conexão segue.
+    fn copy(&mut self, ch: &mut Chan, sql: &str) -> Result<()> {
+        let outcome = match parse_copy(sql) {
+            Ok(spec) if spec.copy_in => self.copy_in(ch, &spec)?,
+            Ok(spec) => self.copy_out(ch, &spec),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(n) => command_complete(ch, &format!("COPY {n}"))?,
+            Err(e) => error_response(ch, sqlstate(&e), &e.to_string())?,
+        }
+        self.send_notifications(ch)?;
+        ready(ch, self.status())
+    }
+
+    /// Erro externo: conexão perdida; `Ok(Err(_))`: COPY recusado.
+    fn copy_in(&mut self, ch: &mut Chan, spec: &CopySpec) -> Result<Result<u64>> {
+        let cols = match self.copy_columns(spec) {
+            Ok(cols) => cols,
+            Err(e) => return Ok(Err(e)),
+        };
+        copy_response(ch, b'G', cols.len())?;
+        ch.flush()?;
+        let data = copy_receive(ch)?;
+        Ok(data.and_then(|d| self.copy_insert(spec, &cols, &d)))
+    }
+
+    /// Confere o privilégio e a tabela antes de pedir os dados; devolve as colunas a preencher.
+    fn copy_columns(&mut self, spec: &CopySpec) -> Result<Vec<String>> {
+        let CopyTarget::Table(name, columns) = &spec.target else {
+            return Err(bad("FROM exige uma tabela"));
+        };
+        self.session.authorize_object(name, Privilege::Insert)?;
+        let sql = format!("DESCRIBE {}", quote_ident(name));
+        let ExecResult::Table { rows, .. } = self.run(&sql, &[])? else {
+            return Err(bad("tabela sem descrição"));
+        };
+        let mut all = Vec::new();
+        for row in &rows {
+            if matches!(row.get(1), Some(Value::Text(t)) if t == "VIEW") {
+                return Err(bad("não copia para uma view"));
+            }
+            all.extend(row.first().map(ToString::to_string));
+        }
+        if columns.is_empty() {
+            return Ok(all);
+        }
+        for c in columns {
+            if !all.contains(c) {
+                let msg = format!("a coluna {c:?} não existe em {name:?}");
+                return Err(bad(&msg));
+            }
+        }
+        Ok(columns.clone())
+    }
+
+    /// Insere os dados numa transação só (a do cliente, se aberta; senão uma própria):
+    /// qualquer erro desfaz tudo.
+    fn copy_insert(&mut self, spec: &CopySpec, cols: &[String], data: &[u8]) -> Result<u64> {
+        let own = !self.session.in_transaction();
+        if own {
+            self.run("BEGIN", &[])?;
+        }
+        let outcome = self.copy_rows(spec, cols, data);
+        if !own {
+            return outcome;
+        }
+        match outcome {
+            Ok(n) => self.run("COMMIT", &[]).map(|_| n),
+            Err(e) => {
+                let _ = self.run("ROLLBACK", &[]);
+                Err(e)
+            }
+        }
+    }
+
+    /// `INSERT` parametrizado de até `COPY_CHUNK` linhas por comando; todo valor vai
+    /// como texto e o motor converte para o tipo da coluna na atribuição.
+    fn copy_rows(&mut self, spec: &CopySpec, cols: &[String], data: &[u8]) -> Result<u64> {
+        let width = cols.len();
+        let mut rows = CopyRows {
+            data,
+            pos: 0,
+            line: 0,
+            opts: &spec.opts,
+        };
+        let table = quote_ident(spec.table());
+        let list = quote_list(cols);
+        let head = format!("INSERT INTO {table} ({list}) VALUES ");
+        let mut total = 0usize;
+        loop {
+            let mut params = Vec::new();
+            let mut n = 0;
+            while n < COPY_CHUNK {
+                let Some(row) = rows.next_row(width)? else {
+                    break;
+                };
+                for f in row {
+                    params.push(f.map_or(Value::Null, Value::Text));
+                }
+                n += 1;
+            }
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if total > MAX_COPY_ROWS {
+                return Err(bad("passou do limite de 1.000.000 de linhas"));
+            }
+            let tuples: Vec<String> = (0..n).map(|r| placeholders(r, width)).collect();
+            let sql = format!("{head}{}", tuples.join(", "));
+            self.run(&sql, &params)?;
+        }
+        Ok(total as u64)
+    }
+
+    /// `COPY tabela|(consulta) TO STDOUT`: a consulta roda inteira antes de enviar
+    /// qualquer coisa, então um erro ainda vira `ErrorResponse` normal.
+    fn copy_out(&mut self, ch: &mut Chan, spec: &CopySpec) -> Result<u64> {
+        let sql = match &spec.target {
+            CopyTarget::Table(name, columns) => {
+                let list = if columns.is_empty() {
+                    "*".to_string()
+                } else {
+                    quote_list(columns)
+                };
+                format!("SELECT {list} FROM {}", quote_ident(name))
+            }
+            CopyTarget::Query(q) => {
+                let word: String = q.chars().take_while(char::is_ascii_alphabetic).collect();
+                if !matches!(word.to_ascii_lowercase().as_str(), "select" | "with" | "values") {
+                    return Err(bad("(consulta) deve ser SELECT, WITH ou VALUES"));
+                }
+                q.clone()
+            }
+        };
+        let result = tabular(self.run(&sql, &[])?);
+        let ExecResult::Table { columns, rows } = result else {
+            return Err(bad("a consulta não devolve linhas"));
+        };
+        copy_response(ch, b'H', columns.len())?;
+        for row in &rows {
+            let fields: Fields = row.iter().map(text_of).collect();
+            send(ch, b'd', &copy_line(&fields, &spec.opts))?;
+        }
+        send(ch, b'c', &[])?;
+        Ok(rows.len() as u64)
     }
 }
 
@@ -1053,7 +1653,11 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
                 skipping = false;
                 let mut pos = 0;
                 let sql = take_cstr(&body, &mut pos)?;
-                conn.simple_query(&mut ch, &sql)?;
+                if is_copy(&sql) {
+                    conn.copy(&mut ch, &sql)?;
+                } else {
+                    conn.simple_query(&mut ch, &sql)?;
+                }
             }
             _ if skipping => {}
             _ => {
