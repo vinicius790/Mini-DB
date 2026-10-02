@@ -57,6 +57,15 @@ Segurança
 - Regex: orçamento total de passos por varredura, além do limite por posição inicial.
 - `encrypt`/`decrypt`/`rekey` seguram o lock do diretório do início ao fim e recusam
   um banco aberto.
+- Criptografia em repouso: as páginas de bancos novos são autenticadas (formato v2,
+  `data.mdb.key` de versão 2): ChaCha20-Poly1305 por página, nonce `id ‖ 8 bytes
+  aleatórios` e AAD com a posição, etiqueta de 80 bits no lugar do magic, do id, do LSN e
+  do CRC16 do cabeçalho (os campos restantes do cabeçalho vão cifrados). Byte alterado,
+  página trocada de lugar ou cabeçalho adulterado dão `CorruptPage`; antes o CRC16 ficava
+  em claro (refeito ou zerado por quem tem o arquivo). Bancos antigos (chave v1) abrem
+  como antes, sem a proteção; `encrypt`/`rekey` (`convert`), mesmo com a mesma senha, os
+  migram para v2. Não cobre *replay* de uma versão antiga e válida da mesma página nem o
+  WAL cifrado (sem etiqueta).
 
 Correções
 - WAL: `Begin` com operações pendentes de outra transação volta a ser erro (não

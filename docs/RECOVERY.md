@@ -41,6 +41,19 @@ trocando durabilidade por desempenho; checkpoints continuam sincronizando a imag
 publicada. Em sistemas não Unix o `fsync` do diretório é um no-op, então a ordem de
 publicação por rename depende do sistema de arquivos.
 
+## Integridade com criptografia em repouso
+
+Em bancos cifrados criados a partir desta versão (`data.mdb.key` de versão 2), cada página
+de `data.mdb`, do journal e do spill leva uma etiqueta Poly1305 de 80 bits (ChaCha20-Poly1305,
+nonce `id ‖ 8 bytes aleatórios`, AAD com a posição). A etiqueta substitui o magic, o id, o
+LSN e o CRC16 do cabeçalho de 32 bytes, então a página continua com 4096 bytes, sem arquivo
+lateral e sem mexer no journal: a etiqueta viaja com a página e a recuperação do journal
+continua uma cópia de bytes. Alterar um byte, mover uma página de lugar ou adulterar o
+cabeçalho dá `CorruptPage` na leitura. Bancos de chave versão 1 mantêm o formato antigo
+(CRC16 em claro, que quem tem o arquivo refaz ou zera) e migram com `encrypt`/`rekey`.
+Não há proteção contra *replay* (devolver uma versão antiga e válida da mesma página) nem
+etiqueta nos frames do WAL cifrado, que contam só com o CRC32 do frame.
+
 ## VACUUM
 
 `VACUUM` remove as chaves expiradas, faz checkpoint e reconstrói as árvores em streaming

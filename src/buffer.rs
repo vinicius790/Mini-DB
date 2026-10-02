@@ -391,13 +391,17 @@ impl Inner {
         file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
         let mut buf = [0u8; PAGE_SIZE];
         file.read_exact(&mut buf)?;
-        let mut page = Page::from_bytes(&buf)?;
-        if page.page_id() != page_id {
-            return Err(Error::CorruptPage(page_id));
-        }
-        if let Some(c) = cipher {
-            c.open_page(&mut page)?;
-        }
+        let page = match cipher {
+            // Páginas cifradas: a posição lida é o id esperado (a etiqueta o autentica).
+            Some(c) => c.open_page(page_id, &buf)?,
+            None => {
+                let page = Page::from_bytes(&buf)?;
+                if page.page_id() != page_id {
+                    return Err(Error::CorruptPage(page_id));
+                }
+                page
+            }
+        };
         page.validate_header()?;
         Ok(page)
     }
