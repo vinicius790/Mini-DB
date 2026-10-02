@@ -891,8 +891,11 @@ fn deep_expression_child() {
     let mut db = Db::open(tmpdir("deep-child")).unwrap();
     ok(&mut db, "CREATE TABLE deep (x INT)");
     ok(&mut db, "INSERT INTO deep VALUES (1)");
+    // As marcas dizem ao teste pai em que consulta o processo caiu.
+    eprintln!("soma");
     let sum = format!("SELECT 1{} FROM deep", " + x".repeat(links));
     assert_eq!(q(&mut db, &sum), [(links + 1).to_string()]);
+    eprintln!("filtro");
     let ors = " OR x = 0".repeat(links - 1);
     let filter = format!("SELECT x FROM deep WHERE x = 0{ors} OR x = 1");
     assert_eq!(q(&mut db, &filter), ["1"]);
@@ -902,15 +905,13 @@ fn deep_expression_child() {
 fn accepted_expression_chains_fit_in_a_default_thread_stack() {
     // Estouro de pilha derruba o processo: cada tamanho roda num subprocesso, na
     // thread de 2 MiB que o libtest dá a cada teste. 999 é o maior que o parser aceita.
-    let run = |links: usize| {
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "deep_expression_child"])
+    for links in [125, 250, 500, 999] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "deep_expression_child", "--nocapture"])
             .env("MINIDB_DEEP_LINKS", links.to_string())
             .output()
-            .unwrap()
-            .status
-            .success()
-    };
-    let fits = [125, 250, 500, 999].map(|n| (n, run(n)));
-    assert!(fits.iter().all(|&(_, ok)| ok), "{fits:?}");
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{links} elos: {log}");
+    }
 }

@@ -2305,7 +2305,64 @@ impl<'a> Exec<'a> {
         Err(unknown_column(table, name))
     }
 
+    /// Um elo de operador binário: `left` já avaliado, `right` só se for preciso.
+    fn bin(&self, left: Value, op: BinOp, right: &Expr, ctx: &Ctx<'_>) -> Result<Value> {
+        Ok(match op {
+            BinOp::And => {
+                let a = left.truth();
+                if a == Some(false) {
+                    return Ok(Value::Bool(false));
+                }
+                truth(match (a, self.eval(right, ctx)?.truth()) {
+                    (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+            }
+            BinOp::Or => {
+                let a = left.truth();
+                if a == Some(true) {
+                    return Ok(Value::Bool(true));
+                }
+                truth(match (a, self.eval(right, ctx)?.truth()) {
+                    (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+            }
+            _ => {
+                let b = self.eval(right, ctx)?;
+                match compare(&left, op, &b) {
+                    Some(v) => v,
+                    None => arith(left, op, b)?,
+                }
+            }
+        })
+    }
+
+    /// Cadeia de operadores à esquerda (`a + b + c ...`, `x OR y OR z ...`): desce pela
+    /// espinha em laço e sobe aplicando um elo por vez, sem uma chamada recursiva por
+    /// elo (uma cadeia longa estouraria a pilha).
+    fn eval_chain(&self, e: &Expr, ctx: &Ctx<'_>) -> Result<Value> {
+        let mut spine = Vec::new();
+        let mut node = e;
+        while let Expr::Bin(a, op, b) = node {
+            spine.push((*op, b.as_ref()));
+            node = a.as_ref();
+        }
+        let mut acc = self.eval(node, ctx)?;
+        for (op, right) in spine.into_iter().rev() {
+            acc = self.bin(acc, op, right, ctx)?;
+        }
+        Ok(acc)
+    }
+
     pub(super) fn eval(&self, e: &Expr, ctx: &Ctx<'_>) -> Result<Value> {
+        if let Expr::Bin(first, _, _) = e {
+            if matches!(**first, Expr::Bin(..)) {
+                return self.eval_chain(e, ctx);
+            }
+        }
         let ev = |x: &Expr| self.eval(x, ctx);
         Ok(match e {
             Expr::Lit(v) => v.clone(),
@@ -2330,35 +2387,7 @@ impl<'a> Exec<'a> {
                 other => return Err(Error::Sql(format!("~ de {}", other.type_name()))),
             },
             Expr::Not(x) => truth(ev(x)?.truth().map(|b| !b)),
-            Expr::Bin(a, BinOp::And, b) => {
-                let a = ev(a)?.truth();
-                if a == Some(false) {
-                    return Ok(Value::Bool(false));
-                }
-                truth(match (a, ev(b)?.truth()) {
-                    (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                })
-            }
-            Expr::Bin(a, BinOp::Or, b) => {
-                let a = ev(a)?.truth();
-                if a == Some(true) {
-                    return Ok(Value::Bool(true));
-                }
-                truth(match (a, ev(b)?.truth()) {
-                    (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                })
-            }
-            Expr::Bin(a, op, b) => {
-                let (a, b) = (ev(a)?, ev(b)?);
-                match compare(&a, *op, &b) {
-                    Some(v) => v,
-                    None => arith(a, *op, b)?,
-                }
-            }
+            Expr::Bin(a, op, b) => self.bin(ev(a)?, *op, b, ctx)?,
             Expr::IsNull(x, neg) => Value::Bool(ev(x)?.is_null() != *neg),
             Expr::IsDistinct(a, b, neg) => {
                 let (a, b) = (ev(a)?, ev(b)?);
