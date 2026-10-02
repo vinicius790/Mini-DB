@@ -1,6 +1,6 @@
 //! Primitivas criptográficas sem dependências: SHA-256 (FIPS 180-4),
-//! HMAC-SHA256 (RFC 2104), ChaCha20 (RFC 8439), comparação em tempo constante
-//! e bytes aleatórios do sistema.
+//! HMAC-SHA256 (RFC 2104), ChaCha20 (RFC 8439), AES-128-GCM (SP 800-38D),
+//! comparação em tempo constante e bytes aleatórios do sistema.
 //!
 //! Usadas para autenticar e cifrar o canal de replicação com chave
 //! pré-compartilhada e para o hash do índice por valor. Todas têm testes com
@@ -526,6 +526,13 @@ fn aead_tag(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ct: &[u8]) -> [u8; 16]
     poly1305(&otk, &mac)
 }
 
+/// Etiqueta (16 bytes) do AEAD sobre um texto cifrado já produzido com
+/// `chacha20_xor(.., contador 1, ..)`. Para quem guarda a etiqueta à parte,
+/// truncada (páginas de `data.mdb`).
+pub fn aead_tag_of(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ct: &[u8]) -> [u8; 16] {
+    aead_tag(key, nonce, aad, ct)
+}
+
 /// AEAD ChaCha20-Poly1305: devolve texto cifrado ‖ etiqueta (16 bytes).
 pub fn aead_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plain: &[u8]) -> Vec<u8> {
     let mut out = plain.to_vec();
@@ -546,6 +553,212 @@ pub fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], sealed: &[u8]) ->
     }
     let mut out = ct.to_vec();
     chacha20_xor(key, nonce, 1, &mut out);
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// AES-128 (FIPS 197) e AES-128-GCM (NIST SP 800-38D)
+// ---------------------------------------------------------------------------
+
+/// Multiplica por x em GF(2^8) (polinômio x^8 + x^4 + x^3 + x + 1), sem desvios.
+const fn xtime(x: u8) -> u8 {
+    (x << 1) ^ (0x1b & (x >> 7).wrapping_neg())
+}
+
+/// S-box do AES calculada em tempo de compilação: inverso multiplicativo
+/// (por log/exp do gerador 3) seguido da transformação afim da FIPS 197 §5.1.1.
+const fn make_sbox() -> [u8; 256] {
+    let mut exp = [0u8; 256];
+    let mut log = [0u8; 256];
+    let mut x = 1u8;
+    let mut i = 0;
+    while i < 255 {
+        exp[i] = x;
+        log[x as usize] = i as u8;
+        x ^= xtime(x); // multiplica por 3
+        i += 1;
+    }
+    let mut sbox = [0u8; 256];
+    let mut v = 0;
+    while v < 256 {
+        let inv = if v == 0 {
+            0
+        } else {
+            exp[(255 - log[v] as usize) % 255]
+        };
+        let mut s = inv;
+        let mut r = 1;
+        while r <= 4 {
+            s ^= inv.rotate_left(r);
+            r += 1;
+        }
+        sbox[v] = s ^ 0x63;
+        v += 1;
+    }
+    sbox
+}
+
+// ponytail: a consulta `SBOX[byte]` indexa a memória por um valor secreto, então
+// o AES por tabela pode vazar a chave por temporização de cache em quem
+// compartilha o processador; é só 256 bytes (cabem em poucas linhas de cache),
+// mas não é tempo constante estrito. Subir o limite exigiria AES-NI
+// (`std::arch`, via `unsafe`) ou uma S-box bit-sliced.
+static SBOX: [u8; 256] = make_sbox();
+
+/// AES-128 só para encriptar (o GCM usa a cifra apenas nesse sentido).
+struct Aes128 {
+    round_keys: [[u8; 16]; 11],
+}
+
+fn xor_block(s: &mut [u8; 16], k: &[u8; 16]) {
+    for (a, b) in s.iter_mut().zip(k) {
+        *a ^= b;
+    }
+}
+
+/// SubBytes seguido de ShiftRows (o estado é em colunas: índice = 4·coluna + linha).
+fn sub_shift(s: &mut [u8; 16]) {
+    let t = *s;
+    *s = std::array::from_fn(|i| SBOX[t[4 * ((i / 4 + i % 4) % 4) + i % 4] as usize]);
+}
+
+fn mix_columns(s: &mut [u8; 16]) {
+    for col in s.chunks_exact_mut(4) {
+        let a = [col[0], col[1], col[2], col[3]];
+        let all = a[0] ^ a[1] ^ a[2] ^ a[3];
+        for (i, b) in col.iter_mut().enumerate() {
+            *b = a[i] ^ all ^ xtime(a[i] ^ a[(i + 1) % 4]);
+        }
+    }
+}
+
+impl Aes128 {
+    fn new(key: &[u8; 16]) -> Aes128 {
+        let mut w = [[0u8; 4]; 44];
+        for (word, k) in w.iter_mut().zip(key.chunks_exact(4)) {
+            word.copy_from_slice(k);
+        }
+        let mut rcon = 1u8;
+        for i in 4..44 {
+            let mut t = w[i - 1];
+            if i & 3 == 0 {
+                t = [
+                    SBOX[t[1] as usize] ^ rcon,
+                    SBOX[t[2] as usize],
+                    SBOX[t[3] as usize],
+                    SBOX[t[0] as usize],
+                ];
+                rcon = xtime(rcon);
+            }
+            let prev = w[i - 4];
+            w[i] = std::array::from_fn(|j| prev[j] ^ t[j]);
+        }
+        let mut round_keys = [[0u8; 16]; 11];
+        for (rk, words) in round_keys.iter_mut().zip(w.chunks_exact(4)) {
+            for (dst, word) in rk.chunks_exact_mut(4).zip(words) {
+                dst.copy_from_slice(word);
+            }
+        }
+        Aes128 { round_keys }
+    }
+
+    fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
+        let mut s = *block;
+        xor_block(&mut s, &self.round_keys[0]);
+        for rk in &self.round_keys[1..10] {
+            sub_shift(&mut s);
+            mix_columns(&mut s);
+            xor_block(&mut s, rk);
+        }
+        sub_shift(&mut s);
+        xor_block(&mut s, &self.round_keys[10]);
+        s
+    }
+}
+
+/// Polinômio de redução do GHASH (x^128 + x^7 + x^2 + x + 1) no bit mais alto.
+const GCM_R: u128 = 0xe1 << 120;
+
+/// Multiplicação em GF(2^128) do GCM (SP 800-38D §6.3), bit a bit e com
+/// máscaras em vez de desvios: tempo e acessos independentes dos operandos.
+fn gf_mul(x: u128, y: u128) -> u128 {
+    let mut z = 0u128;
+    let mut v = y;
+    for i in 0..128 {
+        z ^= v & ((x >> (127 - i)) & 1).wrapping_neg();
+        v = (v >> 1) ^ (GCM_R & (v & 1).wrapping_neg());
+    }
+    z
+}
+
+fn ghash_update(y: &mut u128, h: u128, data: &[u8]) {
+    for chunk in data.chunks(16) {
+        let mut b = [0u8; 16];
+        b[..chunk.len()].copy_from_slice(chunk);
+        *y = gf_mul(*y ^ u128::from_be_bytes(b), h);
+    }
+}
+
+/// Cifra/decifra `data` com AES-CTR, começando em inc32(J0) (SP 800-38D §6.5).
+fn gcm_ctr(aes: &Aes128, j0: &[u8; 16], data: &mut [u8]) {
+    let mut ctr = *j0;
+    for chunk in data.chunks_mut(16) {
+        let n = u32::from_be_bytes([ctr[12], ctr[13], ctr[14], ctr[15]]).wrapping_add(1);
+        ctr[12..].copy_from_slice(&n.to_be_bytes());
+        let stream = aes.encrypt_block(&ctr);
+        for (b, k) in chunk.iter_mut().zip(stream) {
+            *b ^= k;
+        }
+    }
+}
+
+/// Cifra, subchave H do GHASH e bloco J0 (IV de 12 bytes ‖ contador 1).
+fn gcm_init(key: &[u8; 16], nonce: &[u8; 12]) -> (Aes128, u128, [u8; 16]) {
+    let aes = Aes128::new(key);
+    let h = u128::from_be_bytes(aes.encrypt_block(&[0u8; 16]));
+    let mut j0 = [0u8; 16];
+    j0[..12].copy_from_slice(nonce);
+    j0[15] = 1;
+    (aes, h, j0)
+}
+
+fn gcm_tag(aes: &Aes128, h: u128, j0: &[u8; 16], aad: &[u8], ct: &[u8]) -> [u8; 16] {
+    let mut y = 0u128;
+    ghash_update(&mut y, h, aad);
+    ghash_update(&mut y, h, ct);
+    let lengths = ((aad.len() as u128 * 8) << 64) | (ct.len() as u128 * 8);
+    y = gf_mul(y ^ lengths, h);
+    (y ^ u128::from_be_bytes(aes.encrypt_block(j0))).to_be_bytes()
+}
+
+/// AEAD AES-128-GCM com nonce de 12 bytes: devolve texto cifrado ‖ etiqueta (16 bytes).
+pub fn aes128_gcm_seal(key: &[u8; 16], nonce: &[u8; 12], aad: &[u8], plain: &[u8]) -> Vec<u8> {
+    let (aes, h, j0) = gcm_init(key, nonce);
+    let mut out = plain.to_vec();
+    gcm_ctr(&aes, &j0, &mut out);
+    let tag = gcm_tag(&aes, h, &j0, aad, &out);
+    out.extend_from_slice(&tag);
+    out
+}
+
+/// Abre um texto cifrado com etiqueta; `None` se a etiqueta não confere (a
+/// comparação é em tempo constante e o texto só é decifrado depois dela).
+pub fn aes128_gcm_open(
+    key: &[u8; 16],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    sealed: &[u8],
+) -> Option<Vec<u8>> {
+    if sealed.len() < 16 {
+        return None;
+    }
+    let (ct, tag) = sealed.split_at(sealed.len() - 16);
+    let (aes, h, j0) = gcm_init(key, nonce);
+    if !constant_time_eq(&gcm_tag(&aes, h, &j0, aad, ct), tag) {
+        return None;
+    }
+    let mut out = ct.to_vec();
+    gcm_ctr(&aes, &j0, &mut out);
     Some(out)
 }
 
@@ -617,6 +830,122 @@ mod aead_tests {
             to_hex(&okm),
             "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
         );
+    }
+}
+
+#[cfg(test)]
+mod aes_gcm_tests {
+    use super::*;
+
+    const P3: [&str; 4] = [
+        "d9313225f88406e5a55909c5aff5269a",
+        "86a7a9531534f7da2e4c303d8a318a72",
+        "1c3c0c95956809532fcf0e2449a6b525",
+        "b16aedf5aa0de657ba637b391aafd255",
+    ];
+    const C3: [&str; 4] = [
+        "42831ec2217774244b7221b784d0d49c",
+        "e3aa212f2c02a4e035c17e2329aca12e",
+        "21d514b25466931c7d8f6a5aac84aa05",
+        "1ba30b396a0aac973d58e091473f5985",
+    ];
+    const ZERO_KEY: &str = "00000000000000000000000000000000";
+    const ZERO_IV: &str = "000000000000000000000000";
+    const KEY_TC3: &str = "feffe9928665731c6d6a8f9467308308";
+    const IV_TC3: &str = "cafebabefacedbaddecaf888";
+
+    fn hx(s: &str) -> Vec<u8> {
+        from_hex(s).unwrap()
+    }
+
+    /// Sela e abre com um vetor conhecido; qualquer bit alterado deve falhar.
+    fn check(key: &str, iv: &str, aad: &str, plain: &str, cipher: &str, tag: &str) {
+        let key: [u8; 16] = hx(key).try_into().unwrap();
+        let iv: [u8; 12] = hx(iv).try_into().unwrap();
+        let (aad, plain) = (hx(aad), hx(plain));
+        let sealed = aes128_gcm_seal(&key, &iv, &aad, &plain);
+        let (ct, t) = sealed.split_at(plain.len());
+        assert_eq!(to_hex(ct), cipher);
+        assert_eq!(to_hex(t), tag);
+        assert_eq!(aes128_gcm_open(&key, &iv, &aad, &sealed), Some(plain));
+        let flip = |i: usize| {
+            let mut bad = sealed.clone();
+            bad[i] ^= 1;
+            bad
+        };
+        for i in 0..sealed.len() {
+            assert!(aes128_gcm_open(&key, &iv, &aad, &flip(i)).is_none());
+        }
+        if !aad.is_empty() {
+            let mut bad = aad.clone();
+            bad[0] ^= 1;
+            assert!(aes128_gcm_open(&key, &iv, &bad, &sealed).is_none());
+        }
+    }
+
+    #[test]
+    fn aes128_matches_fips197() {
+        let key: [u8; 16] = hx("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
+        let block: [u8; 16] = hx("00112233445566778899aabbccddeeff").try_into().unwrap();
+        let out = Aes128::new(&key).encrypt_block(&block);
+        assert_eq!(to_hex(&out), "69c4e0d86a7b0430d8cdb78070b4c55a");
+        assert_eq!(SBOX[0x00], 0x63);
+        assert_eq!(SBOX[0x53], 0xed);
+    }
+
+    #[test]
+    fn gcm_matches_nist_test_cases() {
+        // Test Case 1: sem texto e sem AAD.
+        check(
+            ZERO_KEY,
+            ZERO_IV,
+            "",
+            "",
+            "",
+            "58e2fccefa7e3061367f1d57a4e7455a",
+        );
+        // Test Case 2: um bloco de zeros.
+        check(
+            ZERO_KEY,
+            ZERO_IV,
+            "",
+            "00000000000000000000000000000000",
+            "0388dace60b6a392f328c2b971b2fe78",
+            "ab6e47d42cec13bdf53a67b21257bddf",
+        );
+        // Test Case 3: quatro blocos, sem AAD.
+        let (p3, c3) = (P3.concat(), C3.concat());
+        check(
+            KEY_TC3,
+            IV_TC3,
+            "",
+            &p3,
+            &c3,
+            "4d5c2af327cd64a62cf35abd2ba6fab4",
+        );
+        // Test Case 4: 60 bytes (último bloco parcial) com AAD.
+        check(
+            KEY_TC3,
+            IV_TC3,
+            "feedfacedeadbeeffeedfacedeadbeefabaddad2",
+            &p3[..120],
+            &c3[..120],
+            "5bc94fbc3221a5db94fae95ae7121a47",
+        );
+    }
+
+    #[test]
+    fn gcm_roundtrips_every_length_and_rejects_short_input() {
+        let key = [7u8; 16];
+        let nonce = [9u8; 12];
+        for n in 0..70usize {
+            let plain: Vec<u8> = (0..n).map(|i| (i * 31) as u8).collect();
+            let aad: Vec<u8> = (0..n % 21).map(|i| i as u8).collect();
+            let sealed = aes128_gcm_seal(&key, &nonce, &aad, &plain);
+            assert_eq!(sealed.len(), n + 16);
+            assert_eq!(aes128_gcm_open(&key, &nonce, &aad, &sealed), Some(plain));
+        }
+        assert!(aes128_gcm_open(&key, &nonce, b"", &[0u8; 15]).is_none());
     }
 }
 

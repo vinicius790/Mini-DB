@@ -2,6 +2,16 @@
 
 ## Não lançado (correções pós-1.3.0)
 
+TLS
+- TLS 1.3 passa a suportar também `TLS_AES_128_GCM_SHA256` (0x1301, a suíte obrigatória do
+  RFC 8446 e a primeira que clientes comuns oferecem), além de `TLS_CHACHA20_POLY1305_SHA256`;
+  o servidor escolhe a primeira suíte da lista do cliente que ele suporta. Só o AEAD do
+  registro muda (chave de 16 bytes, mesmo hash SHA-256 e mesma agenda de chaves).
+  `src/crypto.rs` ganhou AES-128 (S-box gerada em tempo de compilação), GHASH sem desvios
+  e `aes128_gcm_seal`/`aes128_gcm_open`, com os vetores do NIST (Test Cases 1 a 4) e teste
+  de integração contra `openssl s_client` (`tests/review_aesgcm.rs`). Limite conhecido: a
+  consulta à S-box não é em tempo constante estrito (risco de temporização de cache).
+
 COPY
 - PostgreSQL: `COPY tabela [(colunas)] FROM STDIN`, `COPY tabela [(colunas)] TO STDOUT` e
   `COPY (SELECT ...) TO STDOUT` no formato texto (`DELIMITER`, `NULL`, escapes, `\.`),

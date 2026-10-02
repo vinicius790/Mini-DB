@@ -155,7 +155,7 @@ nem `COPY` no protocolo estendido; o `COPY` precisa ser o único comando da mens
 é devolvido na hora; `CopyData` fora de um `COPY` é ignorado, como no PostgreSQL.
 
 **TLS 1.3 nativo** (1.1): com `tls = true` (padrão) o servidor aceita `SSLRequest` e
-negocia TLS 1.3 (X25519, ChaCha20-Poly1305, Ed25519) sem dependências. Na primeira
+negocia TLS 1.3 (X25519, AES-128-GCM ou ChaCha20-Poly1305, Ed25519) sem dependências. Na primeira
 execução gera `tls.key` (PKCS#8 Ed25519) e `tls.crt` (X.509 autoassinado, SAN com o
 host/IP configurado, `localhost` e `127.0.0.1`) no diretório do banco.
 `sslmode=require` funciona direto; `sslmode=verify-full sslrootcert=tls.crt` também.

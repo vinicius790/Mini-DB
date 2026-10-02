@@ -66,7 +66,7 @@ any port.
 
 - With no token and no users the database runs in *open mode*: any local process can
   use the HTTP and TCP APIs. Set `MINIDB_TOKEN` or create users.
-- The cryptography (TLS 1.3, X.509, RSA, ECDSA, Ed25519, ChaCha20-Poly1305) is written
+- The cryptography (TLS 1.3, X.509, RSA, ECDSA, Ed25519, AES-GCM, ChaCha20-Poly1305) is written
   from scratch and has **not** been externally audited. Where that matters, terminate
   TLS in an audited proxy.
 - One writer at a time (like SQLite and LMDB); readers run in parallel.

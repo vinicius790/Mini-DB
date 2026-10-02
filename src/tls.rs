@@ -1,6 +1,7 @@
-//! TLS 1.3 (RFC 8446) do lado do servidor, sem dependências: suíte
-//! TLS_CHACHA20_POLY1305_SHA256, troca de chaves X25519 e assinatura Ed25519,
-//! ECDSA (P-256/P-384) ou RSA-PSS, conforme a chave do certificado.
+//! TLS 1.3 (RFC 8446) do lado do servidor, sem dependências: suítes
+//! TLS_AES_128_GCM_SHA256 e TLS_CHACHA20_POLY1305_SHA256 (vale a preferida do
+//! cliente), troca de chaves X25519 e assinatura Ed25519, ECDSA (P-256/P-384)
+//! ou RSA-PSS, conforme a chave do certificado.
 //!
 //! PKI: certificado autoassinado gerado na primeira execução (`tls.key`,
 //! `tls.crt`), cadeia própria emitida por uma CA (`minidb cert ca|issue`,
@@ -13,7 +14,8 @@
 //! compatível com a chave, ou TLS ≤ 1.2, recebem `handshake_failure`.
 
 use crate::crypto::{
-    aead_open, aead_seal, hkdf_expand, hkdf_extract, hmac_sha256, random_bytes, sha256,
+    aead_open, aead_seal, aes128_gcm_open, aes128_gcm_seal, hkdf_expand, hkdf_extract, hmac_sha256,
+    random_bytes, sha256,
 };
 use crate::curve25519::{x25519, x25519_base};
 use crate::error::{Error, Result};
@@ -191,18 +193,56 @@ fn derive_secret(secret: &[u8; 32], label: &str, transcript_hash: &[u8; 32]) -> 
         .expect("32")
 }
 
+/// Suítes TLS 1.3 aceitas (RFC 8446 §9.1); o hash é SHA-256 nas duas, então a
+/// agenda de chaves é a mesma e só o AEAD do registro muda.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suite {
+    /// TLS_AES_128_GCM_SHA256 (0x1301), a obrigatória do RFC 8446.
+    Aes128Gcm,
+    /// TLS_CHACHA20_POLY1305_SHA256 (0x1303).
+    ChaCha20Poly1305,
+}
+
+impl Suite {
+    fn from_id(id: [u8; 2]) -> Option<Suite> {
+        match id {
+            [0x13, 0x01] => Some(Suite::Aes128Gcm),
+            [0x13, 0x03] => Some(Suite::ChaCha20Poly1305),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> [u8; 2] {
+        match self {
+            Suite::Aes128Gcm => [0x13, 0x01],
+            Suite::ChaCha20Poly1305 => [0x13, 0x03],
+        }
+    }
+
+    fn key_len(self) -> usize {
+        match self {
+            Suite::Aes128Gcm => 16,
+            Suite::ChaCha20Poly1305 => 32,
+        }
+    }
+}
+
 struct Keys {
+    suite: Suite,
+    /// Só os primeiros `suite.key_len()` bytes valem.
     key: [u8; 32],
     iv: [u8; 12],
     seq: u64,
 }
 
 impl Keys {
-    fn from_secret(secret: &[u8; 32]) -> Keys {
+    fn from_secret(secret: &[u8; 32], suite: Suite) -> Keys {
+        let mut key = [0u8; 32];
+        let derived = hkdf_expand_label(secret, "key", &[], suite.key_len());
+        key[..derived.len()].copy_from_slice(&derived);
         Keys {
-            key: hkdf_expand_label(secret, "key", &[], 32)
-                .try_into()
-                .expect("32"),
+            suite,
+            key,
             iv: hkdf_expand_label(secret, "iv", &[], 12)
                 .try_into()
                 .expect("12"),
@@ -217,6 +257,30 @@ impl Keys {
         }
         self.seq += 1;
         n
+    }
+
+    /// Cifra com o AEAD da suíte (texto cifrado ‖ etiqueta de 16 bytes).
+    fn seal(&mut self, aad: &[u8], plain: &[u8]) -> Vec<u8> {
+        let nonce = self.nonce();
+        match self.suite {
+            Suite::Aes128Gcm => {
+                let key: [u8; 16] = self.key[..16].try_into().expect("16");
+                aes128_gcm_seal(&key, &nonce, aad, plain)
+            }
+            Suite::ChaCha20Poly1305 => aead_seal(&self.key, &nonce, aad, plain),
+        }
+    }
+
+    /// Abre e autentica; `None` se a etiqueta não confere.
+    fn open(&mut self, aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+        let nonce = self.nonce();
+        match self.suite {
+            Suite::Aes128Gcm => {
+                let key: [u8; 16] = self.key[..16].try_into().expect("16");
+                aes128_gcm_open(&key, &nonce, aad, sealed)
+            }
+            Suite::ChaCha20Poly1305 => aead_open(&self.key, &nonce, aad, sealed),
+        }
     }
 }
 
@@ -258,15 +322,17 @@ fn seal_record(keys: &mut Keys, ty: u8, plain: &[u8]) -> Vec<u8> {
     inner.push(ty);
     let len = inner.len() + 16;
     let aad = [REC_APP, 3, 3, (len >> 8) as u8, len as u8];
-    let nonce = keys.nonce();
-    aead_seal(&keys.key, &nonce, &aad, &inner)
+    keys.seal(&aad, &inner)
 }
 
 fn open_record(keys: &mut Keys, body: &[u8]) -> io::Result<(u8, Vec<u8>)> {
     let aad = [REC_APP, 3, 3, (body.len() >> 8) as u8, body.len() as u8];
-    let nonce = keys.nonce();
-    let mut plain = aead_open(&keys.key, &nonce, &aad, body)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "registro TLS não autentica"))?;
+    let Some(mut plain) = keys.open(&aad, body) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registro TLS não autentica",
+        ));
+    };
     while plain.last() == Some(&0) {
         plain.pop();
     }
@@ -379,7 +445,8 @@ struct ClientHello {
     session_id: Vec<u8>,
     key_share: Option<[u8; 32]>,
     supports_13: bool,
-    chacha: bool,
+    /// Primeira suíte da lista do cliente que o servidor também suporta.
+    suite: Option<Suite>,
     sigalgs: Vec<u16>,
 }
 
@@ -406,14 +473,16 @@ fn parse_client_hello(body: &[u8]) -> io::Result<ClientHello> {
     let session_id = take(body, &mut pos, sid_len)?;
     let cs_len = u16_at(body, &mut pos)? as usize;
     let suites = take(body, &mut pos, cs_len)?;
-    let chacha = suites.chunks(2).any(|c| c == [0x13, 0x03]);
+    let suite = suites
+        .chunks_exact(2)
+        .find_map(|c| Suite::from_id([c[0], c[1]]));
     let comp_len = take(body, &mut pos, 1)?[0] as usize;
     take(body, &mut pos, comp_len)?;
     let mut hello = ClientHello {
         session_id,
         key_share: None,
         supports_13: false,
-        chacha,
+        suite,
         sigalgs: Vec::new(),
     };
     if pos >= body.len() {
@@ -590,9 +659,13 @@ pub fn accept<S: Read + Write>(mut inner: S, identity: &Identity) -> io::Result<
     if !hello.supports_13 {
         return Err(fail(&mut inner, 70, "cliente sem TLS 1.3"));
     }
-    if !hello.chacha {
-        return Err(fail(&mut inner, 40, "cliente sem ChaCha20-Poly1305"));
-    }
+    let Some(suite) = hello.suite else {
+        return Err(fail(
+            &mut inner,
+            40,
+            "cliente sem AES-128-GCM nem ChaCha20-Poly1305",
+        ));
+    };
     let Some(scheme) = identity
         .key
         .tls_schemes()
@@ -618,7 +691,8 @@ pub fn accept<S: Read + Write>(mut inner: S, identity: &Identity) -> io::Result<
     sh.extend_from_slice(&random_bytes::<32>());
     sh.push(hello.session_id.len() as u8);
     sh.extend_from_slice(&hello.session_id);
-    sh.extend_from_slice(&[0x13, 0x03, 0]); // suíte, compressão nula
+    sh.extend_from_slice(&suite.id());
+    sh.push(0); // compressão nula
     let mut exts = Vec::new();
     exts.extend_from_slice(&[0, 43, 0, 2, 3, 4]); // supported_versions = 1.3
     exts.extend_from_slice(&[0, 51, 0, 36, 0, 0x1d, 0, 32]);
@@ -638,8 +712,8 @@ pub fn accept<S: Read + Write>(mut inner: S, identity: &Identity) -> io::Result<
     let th = sha256(&transcript);
     let c_hs = derive_secret(&handshake_secret, "c hs traffic", &th);
     let s_hs = derive_secret(&handshake_secret, "s hs traffic", &th);
-    let mut hs_write = Keys::from_secret(&s_hs);
-    let mut hs_read = Keys::from_secret(&c_hs);
+    let mut hs_write = Keys::from_secret(&s_hs, suite);
+    let mut hs_read = Keys::from_secret(&c_hs, suite);
 
     // 4. EncryptedExtensions, [CertificateRequest], Certificate, CertificateVerify, Finished.
     let mut flight = handshake_msg(8, &[0, 0]);
@@ -716,7 +790,7 @@ pub fn accept<S: Read + Write>(mut inner: S, identity: &Identity) -> io::Result<
 
     // 6. Certificado do cliente (mTLS) e Finished. Daqui em diante o servidor já
     //    escreve com as chaves de aplicação (inclusive alertas).
-    let mut app_write = Keys::from_secret(&s_app);
+    let mut app_write = Keys::from_secret(&s_app, suite);
     let client_finished_key: [u8; 32] = hkdf_expand_label(&c_hs, "finished", &[], 32)
         .try_into()
         .expect("32");
@@ -832,7 +906,7 @@ pub fn accept<S: Read + Write>(mut inner: S, identity: &Identity) -> io::Result<
     }
     Ok(TlsStream {
         inner,
-        read_keys: Keys::from_secret(&c_app),
+        read_keys: Keys::from_secret(&c_app, suite),
         write_keys: app_write,
         plain: Vec::new(),
         plain_pos: 0,
@@ -858,6 +932,23 @@ mod tests {
             crate::crypto::to_hex(&derived),
             "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
         );
+    }
+
+    #[test]
+    fn record_keys_roundtrip_in_both_suites() {
+        for suite in [Suite::Aes128Gcm, Suite::ChaCha20Poly1305] {
+            assert_eq!(Suite::from_id(suite.id()), Some(suite));
+            let secret = [5u8; 32];
+            let mut w = Keys::from_secret(&secret, suite);
+            let mut r = Keys::from_secret(&secret, suite);
+            for n in 0..3u8 {
+                let sealed = w.seal(b"aad", &[n; 40]);
+                assert_eq!(r.open(b"aad", &sealed), Some(vec![n; 40]));
+            }
+            let sealed = w.seal(b"aad", b"x");
+            assert!(r.open(b"outro", &sealed).is_none());
+        }
+        assert_eq!(Suite::from_id([0x13, 0x02]), None);
     }
 
     #[test]

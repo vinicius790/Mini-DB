@@ -25,7 +25,7 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
   com SCRAM-SHA-256 (a senha não trafega). Comparações em tempo constante.
 - **TLS 1.3 nativo** (1.1; PKI e mTLS na 1.2): protocolo PostgreSQL (`tls = true`,
   padrão) e HTTP (`https = true`) com implementação própria, sem dependências: X25519,
-  ChaCha20-Poly1305, HKDF-SHA256 e assinatura Ed25519. Três formas de identidade: (1)
+  AES-128-GCM ou ChaCha20-Poly1305, HKDF-SHA256 e assinatura Ed25519. Três formas de identidade: (1)
   certificado autoassinado gerado na primeira execução (`tls.key`/`tls.crt`); (2) **PKI
   própria**: `minidb cert ca <dir>`, `cert server <dir> <host>` e `cert client <dir>
   <usuário>` emitem CA, certificado de servidor (SAN) e certificados de cliente (CN =
@@ -39,7 +39,7 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
   da requisição. `pg_stat_ssl`, `ssl_is_used()` e `ssl_client_dn()` mostram a sessão.
   Só TLS 1.3, sem retomada/0-RTT. Chaves e certificados **Ed25519, ECDSA (P-256/P-384) e
   RSA** (PKCS#8, PKCS#1, SEC1; RSA assina com PSS no handshake e PKCS#1 v1.5/PSS nas
-  cadeias, inclusive de CAs públicas); clientes sem ChaCha20-Poly1305 ou sem esquema de
+  cadeias, inclusive de CAs públicas); clientes sem AES-128-GCM e ChaCha20-Poly1305 ou sem esquema de
   assinatura compatível com a chave recebem `handshake_failure`; recusas depois do
   ServerHello (certificado de cliente de outra CA, vencido, ausente) vão como alerta
   cifrado (`unknown_ca`, `certificate_expired`, `certificate_required`). A aritmética de

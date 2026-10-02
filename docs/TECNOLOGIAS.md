@@ -8,7 +8,7 @@
 - Iteradores por folha, lotes atômicos, TTL com expiração preguiçosa
 - Compressão LZ77 (`src/codec.rs`), MVCC (`src/mvcc.rs`), replicação (`src/replication.rs`)
 - SQL relacional próprio (`src/rel/`): parser, planejador por custo, FTS/HNSW/espacial, regex
-- Criptografia própria, sem bibliotecas: SHA-2, HMAC, PBKDF2, ChaCha20-Poly1305, X25519,
+- Criptografia própria, sem bibliotecas: SHA-2, HMAC, PBKDF2, AES-128-GCM, ChaCha20-Poly1305, X25519,
   Ed25519, ECDSA P-256/P-384, RSA, X.509 e TLS 1.3 (`src/crypto.rs`, `curve25519.rs`,
   `ecc.rs`, `rsa.rs`, `bignum.rs`, `pubkey.rs`, `x509.rs`, `tls.rs`) — sem auditoria externa
 - Sem RocksDB, sem SQLite no hot path
