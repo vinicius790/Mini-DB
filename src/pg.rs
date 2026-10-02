@@ -1527,11 +1527,14 @@ fn handle(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<()> {
             String::from_utf8_lossy(body.get(pos..pos + len as usize).unwrap_or_default())
                 .into_owned()
         };
-        let principal = auth::load(&*db.read()?, &user)?;
+        let (principal, secret) = {
+            let guard = db.read()?;
+            (auth::load(&*guard, &user)?, auth::mock_secret_for(&*guard)?)
+        };
         let outcome = if mechanism != "SCRAM-SHA-256" {
             Err(Error::Unauthorized)
         } else {
-            ScramServer::start(principal.as_ref(), &user, &client_first)
+            ScramServer::start(principal.as_ref(), &user, &client_first, &secret)
         };
         let (server, server_first) = match outcome {
             Ok(v) => v,

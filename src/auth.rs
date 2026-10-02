@@ -640,20 +640,33 @@ pub(crate) fn authorize_object(
 // SCRAM-SHA-256 do lado do servidor (protocolo PostgreSQL)
 // ---------------------------------------------------------------------------
 
-/// Segredo do processo, criado uma única vez, de onde saem as credenciais fictícias.
-fn mock_secret() -> &'static [u8; 32] {
-    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
-    SECRET.get_or_init(crypto::random_bytes::<32>)
+/// Segredo de onde saem as credenciais fictícias, estável entre reinícios e sem
+/// escrever nada no meio do login: HMAC da `server_key` do primeiro superusuário
+/// com login (por ordem de nome). A `server_key` vive só no catálogo; o cliente
+/// vê o sal, nunca ela, e o HMAC é de mão única. Sem nenhum superusuário o
+/// banco está em modo aberto, o SCRAM nem é usado, e cai num segredo por processo.
+///
+/// Limite: apagar esse superusuário, ou trocar a senha dele, troca o segredo, e
+/// com ele o sal anunciado para os nomes inexistentes (uma vez, não a cada reinício).
+pub(crate) fn mock_secret_for(src: &dyn Catalog) -> Result<[u8; 32]> {
+    static FALLBACK: OnceLock<[u8; 32]> = OnceLock::new();
+    let seed = list(src)?
+        .into_iter()
+        .find(|p| p.superuser && p.login && p.scram.is_some())
+        .and_then(|p| p.scram);
+    Ok(match seed {
+        Some(s) => hmac_sha256(&s.server_key, &[b"minidb-mock-v1"]),
+        None => *FALLBACK.get_or_init(crypto::random_bytes::<32>),
+    })
 }
 
 /// Credenciais fictícias de um nome sem login: mesmo formato das reais (sal de
-/// 16 bytes, `SCRAM_ITERATIONS`) e estáveis por nome dentro do processo. Saem
-/// de um HMAC com chave secreta, e não de algo público, para que o cliente não
-/// consiga recalcular o sal e, pela diferença, descobrir quem existe.
-fn mock_scram(user: &str) -> Scram {
-    // ponytail: o segredo é por processo, então o sal fictício muda a cada
-    // reinício (o de um usuário real não); persistir no catálogo se isso importar.
-    let part = |label: &[u8]| hmac_sha256(mock_secret(), &[label, user.as_bytes()]);
+/// 16 bytes, `SCRAM_ITERATIONS`) e estáveis por nome para o mesmo `secret`
+/// (veja `mock_secret_for`). Saem de um HMAC com chave secreta, e não de algo
+/// público, para que o cliente não consiga recalcular o sal e, pela diferença,
+/// descobrir quem existe.
+fn mock_scram(secret: &[u8], user: &str) -> Scram {
+    let part = |label: &[u8]| hmac_sha256(secret, &[label, user.as_bytes()]);
     Scram {
         salt: part(b"salt")[..16].to_vec(),
         iterations: SCRAM_ITERATIONS,
@@ -674,10 +687,12 @@ pub struct ScramServer {
 
 impl ScramServer {
     /// Processa `client-first-message`; devolve `server-first-message`.
+    /// `secret` vem de `mock_secret_for` e gera as credenciais de quem não existe.
     pub fn start(
         principal: Option<&Principal>,
         user: &str,
         client_first: &str,
+        secret: &[u8],
     ) -> Result<(Self, String)> {
         let bad = || Error::Unauthorized;
         // gs2-header: "n,," | "y,," | "p=...,,"
@@ -690,7 +705,7 @@ impl ScramServer {
         }
         let client_nonce = nonce.ok_or_else(bad)?;
         // Calculadas sempre (e sem PBKDF2): quem existe e quem não existe custam o mesmo.
-        let mock = mock_scram(user);
+        let mock = mock_scram(secret, user);
         let (scram, valid_user) = match principal.and_then(|p| p.scram.clone()) {
             Some(s) if principal.is_some_and(|p| p.login) => (s, true),
             _ => (mock, false),
@@ -762,6 +777,9 @@ impl ScramServer {
 mod tests {
     use super::*;
 
+    /// Segredo fixo de teste no lugar do que `mock_secret_for` tira do catálogo.
+    const SECRET: [u8; 32] = [7; 32];
+
     #[test]
     fn scram_roundtrip_like_a_client() {
         let p = Principal::user("ana", "segredo", false);
@@ -771,7 +789,8 @@ mod tests {
         // Cliente
         let client_nonce = "rOprNGfwEbeRWgbNEkqO";
         let client_first = format!("n,,n=ana,r={client_nonce}");
-        let (server, server_first) = ScramServer::start(Some(&p), &p.name, &client_first).unwrap();
+        let (server, server_first) =
+            ScramServer::start(Some(&p), &p.name, &client_first, &SECRET).unwrap();
         let attrs: Vec<&str> = server_first.split(',').collect();
         let combined = attrs[0].strip_prefix("r=").unwrap();
         let salt = crypto::base64_decode(attrs[1].strip_prefix("s=").unwrap()).unwrap();
@@ -801,14 +820,18 @@ mod tests {
                 crypto::base64_encode(&wrong)
             ))
             .is_err());
-        let (ghost, _) = ScramServer::start(None, "ghost", &client_first).unwrap();
+        let (ghost, _) = ScramServer::start(None, "ghost", &client_first, &SECRET).unwrap();
         assert!(ghost.finish(&client_final).is_err());
     }
 
     /// Sal (já decodificado) que o servidor anuncia para `user` no `server-first`.
     fn announced_salt(principal: Option<&Principal>, user: &str) -> Vec<u8> {
+        announced_salt_with(&SECRET, principal, user)
+    }
+
+    fn announced_salt_with(secret: &[u8], principal: Option<&Principal>, user: &str) -> Vec<u8> {
         let first = format!("n,,n={user},r=abc");
-        let (_, server_first) = ScramServer::start(principal, user, &first).unwrap();
+        let (_, server_first) = ScramServer::start(principal, user, &first, secret).unwrap();
         let attrs: Vec<&str> = server_first.split(',').collect();
         assert_eq!(attrs[2], format!("i={SCRAM_ITERATIONS}"));
         crypto::base64_decode(attrs[1].strip_prefix("s=").unwrap()).unwrap()
@@ -834,10 +857,46 @@ mod tests {
     }
 
     #[test]
+    fn mock_secret_survives_restart_and_differs_between_catalogs() {
+        let base = std::env::temp_dir().join(format!("minidb-mock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (dir_a, dir_b) = (base.join("a"), base.join("b"));
+        let secret_of = |dir: &std::path::Path| {
+            let db = crate::db::Db::open(dir).unwrap();
+            mock_secret_for(&db).unwrap()
+        };
+        // Sem usuários: segredo do processo, o mesmo a cada chamada.
+        let open = secret_of(&dir_a);
+        assert_eq!(open, secret_of(&dir_a));
+        for dir in [&dir_a, &dir_b] {
+            let mut db = crate::db::Db::open(dir).unwrap();
+            let sql = "CREATE USER root PASSWORD 'x' SUPERUSER";
+            db.execute_sql(sql).unwrap();
+        }
+        // "Reinício": o catálogo é reaberto do disco e o segredo e o sal se repetem.
+        let a1 = secret_of(&dir_a);
+        let a2 = secret_of(&dir_a);
+        assert_eq!(a1, a2);
+        assert_ne!(a1, open);
+        assert_eq!(
+            announced_salt_with(&a1, None, "ghost"),
+            announced_salt_with(&a2, None, "ghost")
+        );
+        // Outro catálogo (sal e chaves aleatórios próprios) dá outro segredo e outro sal.
+        let b = secret_of(&dir_b);
+        assert_ne!(a1, b);
+        assert_ne!(
+            announced_salt_with(&a1, None, "ghost"),
+            announced_salt_with(&b, None, "ghost")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn scram_unknown_user_always_fails() {
         // Cliente honesto com a senha vazia, a que a derivação antiga usava.
         let first = "n,,n=ghost,r=abc";
-        let (server, server_first) = ScramServer::start(None, "ghost", first).unwrap();
+        let (server, server_first) = ScramServer::start(None, "ghost", first, &SECRET).unwrap();
         let attrs: Vec<&str> = server_first.split(',').collect();
         let salt = crypto::base64_decode(attrs[1].strip_prefix("s=").unwrap()).unwrap();
         let salted = crypto::pbkdf2_sha256(b"", &salt, SCRAM_ITERATIONS);
