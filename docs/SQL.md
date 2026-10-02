@@ -63,8 +63,8 @@ DROP TABLE [IF EXISTS] nome;
 TRUNCATE [TABLE] nome;                       -- apaga tudo e zera a sequência
 ALTER TABLE t ADD [COLUMN] c TIPO [restrições de coluna];   -- linhas antigas recebem o DEFAULT
 ALTER TABLE t DROP [COLUMN] [IF EXISTS] c;   -- reescreve as linhas; derruba índices e CHECKs da coluna
-ALTER TABLE t RENAME [COLUMN] a TO b;        -- atualiza CHECKs e as FKs que apontam para a coluna
-ALTER TABLE t RENAME TO t2;                  -- atualiza as FKs das filhas
+ALTER TABLE t RENAME [COLUMN] a TO b;        -- atualiza CHECKs e FKs; recusa se view/gatilho usa a coluna
+ALTER TABLE t RENAME TO t2;                  -- atualiza FKs e GRANTs; recusa se view/gatilho usa a tabela
 ALTER TABLE t ALTER [COLUMN] c SET DEFAULT expressão | DROP DEFAULT | SET NOT NULL | DROP NOT NULL;
 CREATE [UNIQUE] INDEX [IF NOT EXISTS] nome ON t (a, b);
 CREATE FULLTEXT | VECTOR | SPATIAL INDEX nome ON t (...) [WITH (opção = valor, ...)];  -- ver Busca avançada
@@ -375,6 +375,7 @@ Consultas simples com `LIMIT` param cedo.
 - Consulta full-text só com termos excluídos (`-x`) não casa nada.
 - Gatilhos rodam sem nova checagem de privilégios: quem cria o gatilho precisa dos
   privilégios do corpo (`CREATE TRIGGER` confere isso).
-- `ALTER TABLE ... RENAME` não reescreve views, views materializadas, gatilhos nem
-  `GRANT`s que citam o nome antigo.
+- `ALTER TABLE ... RENAME` migra os `GRANT`s, mas não reescreve views, views materializadas
+  nem gatilhos: se algum depende da tabela (ou da coluna), o comando é recusado; apague a
+  dependência e recrie-a depois de renomear.
 - `DROP TABLE` e `TRUNCATE` não geram eventos de mudança.
