@@ -1,9 +1,10 @@
 //! Expressões regulares (subconjunto POSIX/PCRE usado no SQL): literais, `.`,
 //! `^`/`$`, classes `[a-z]`/`[^...]`, `\d \w \s \b` e negações, quantificadores
 //! `* + ? {n,m}` (gulosos e preguiçosos `*?`), grupos `(...)`/`(?:...)` com
-//! captura e alternância `|`, sinalizador `i`. Casamento por retrocesso com
-//! limite de passos, por posição inicial e por varredura (padrões patológicos
-//! falham em vez de travar).
+//! captura e alternância `|`, sinalizador `i`. O padrão é compilado para um programa
+//! de instruções e casado por retrocesso numa máquina com pilha explícita (no heap, sem
+//! recursão nativa), com limite de passos por posição inicial e por varredura
+//! (padrões patológicos falham em vez de travar).
 
 use crate::error::{Error, Result};
 
@@ -26,7 +27,9 @@ pub type Match = (usize, usize, Vec<Option<(usize, usize)>>);
 
 #[derive(Debug, Clone)]
 pub struct Regex {
-    root: Node,
+    prog: Vec<Inst>,
+    /// Registradores da máquina: `2 * (groups + 1)` de captura, mais os dos laços.
+    regs: usize,
     groups: usize,
     ci: bool,
 }
@@ -36,11 +39,10 @@ const MAX_STEPS: usize = 2_000_000;
 /// para cada uma; sem a soma o pior caso seria `MAX_STEPS` vezes o tamanho do texto).
 /// Folga para buscas quadráticas legítimas: `[a-z]+\d` sobre 10 mil letras gasta 1e8.
 const MAX_TOTAL_STEPS: usize = 100 * MAX_STEPS;
-// ponytail: teto fixo, estimado para 2 MiB de pilha em build de depuração; um grupo
-// repetido (`(ab)*`) casa por volta de 100 voltas. Subir só medindo a pilha no CI.
-/// Chamadas aninhadas de `Matcher::m`; acima disso a busca é abandonada, como em
-/// `MAX_STEPS` (a pilha nativa cresce a cada nível e estourá-la derruba o processo).
-const MAX_DEPTH: usize = 500;
+/// Molduras da pilha de retrocesso (16 bytes cada, no heap); acima disso a busca é
+/// abandonada, como em `MAX_STEPS`. Cada instrução empilha no máximo uma, então o limite
+/// só corta o que já estouraria os passos, mas fixa a memória em uns 32 MB.
+const MAX_FRAMES: usize = MAX_STEPS;
 
 struct Parser<'a> {
     chars: Vec<char>,
@@ -50,7 +52,8 @@ struct Parser<'a> {
     src: &'a str,
 }
 
-/// Aninhamento máximo de grupos e tamanho máximo de texto (a busca é recursiva).
+/// Aninhamento máximo de grupos (o parser e o compilador são recursivos) e tamanho máximo
+/// de texto.
 const MAX_GROUP_DEPTH: usize = 100;
 const MAX_TEXT_CHARS: usize = 50_000;
 
@@ -282,12 +285,143 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Registrador de captura ainda não escrito.
+const NONE: u32 = u32::MAX;
+
+/// Instrução da máquina de retrocesso. Os registradores guardam posições e contadores
+/// (`u32`: o texto tem no máximo `MAX_TEXT_CHARS` caracteres); os de captura ficam em
+/// `2 * grupo` (início) e `2 * grupo + 1` (fim).
+#[derive(Debug, Clone)]
+enum Inst {
+    Char(char),
+    Any,
+    Class(Vec<(char, char)>, bool),
+    Start,
+    End,
+    WordBoundary(bool),
+    /// Empilha um ponto de retrocesso em `.0` (mesma posição) e segue para a próxima
+    /// instrução, que é a alternativa preferida.
+    Split(usize),
+    Jmp(usize),
+    /// Grava a posição atual no registrador `.0`.
+    Save(usize),
+    /// Zera o registrador `.0` (contador de voltas).
+    Zero(usize),
+    /// Cabeça de um laço de grupo, que decide entre mais uma volta e a saída:
+    /// `(contador, mínimo, máximo, guloso, saída)`. A volta começa na instrução seguinte.
+    Loop(usize, usize, Option<usize>, bool, usize),
+    /// Fim de uma volta: `(contador, registrador do início da volta, cabeça)`. Volta vazia
+    /// é recusada (evita laço infinito); senão conta a volta e retorna à cabeça.
+    LoopEnd(usize, usize, usize),
+    /// Repetição de um átomo de um caractere (`Char`, `Any` ou `Class`) em laço, com um só
+    /// ponto de retrocesso: `(átomo, mínimo, máximo, guloso)`.
+    RepOne(Box<Inst>, usize, Option<usize>, bool),
+    Match,
+}
+
+/// Entrada da pilha de retrocesso (no heap): as posições cabem em `u32` pelo mesmo motivo
+/// dos registradores.
+enum Frame {
+    /// Retoma em `(instrução, posição)`.
+    Choice(u32, u32),
+    /// Desfaz uma escrita: `(registrador, valor antigo)`.
+    Restore(u32, u32),
+    /// `RepOne` guloso: retoma em `(instrução, posição, piso)` e, enquanto a posição
+    /// estiver acima do piso, deixa uma moldura para a posição anterior.
+    Greedy(u32, u32, u32),
+    /// `RepOne` preguiçoso: `(a própria instrução, posição, fim)`; estende o casamento
+    /// por mais um caractere (se a posição estiver antes de `fim`) e retoma na seguinte.
+    Lazy(u32, u32, u32),
+}
+
+/// Instrução de um caractere equivalente ao nó, se ele for `Char`, `Any` ou `Class`.
+fn single(node: &Node) -> Option<Inst> {
+    match node {
+        Node::Char(c) => Some(Inst::Char(*c)),
+        Node::Any => Some(Inst::Any),
+        Node::Class(ranges, negated) => Some(Inst::Class(ranges.clone(), *negated)),
+        _ => None,
+    }
+}
+
+struct Compiler {
+    prog: Vec<Inst>,
+    regs: usize,
+}
+
+impl Compiler {
+    fn node(&mut self, node: &Node) {
+        match node {
+            Node::Char(_) | Node::Any | Node::Class(..) => self.prog.extend(single(node)),
+            Node::Start => self.prog.push(Inst::Start),
+            Node::End => self.prog.push(Inst::End),
+            Node::WordBoundary(want) => self.prog.push(Inst::WordBoundary(*want)),
+            Node::Group(inner, cap) => {
+                if let Some(g) = *cap {
+                    self.prog.push(Inst::Save(2 * g));
+                    self.node(inner);
+                    self.prog.push(Inst::Save(2 * g + 1));
+                } else {
+                    self.node(inner);
+                }
+            }
+            Node::Alt(alts) => self.alt(alts),
+            Node::Seq(items) => {
+                for item in items {
+                    self.node(item);
+                }
+            }
+            Node::Repeat(inner, min, max, greedy) => self.repeat(inner, *min, *max, *greedy),
+        }
+    }
+
+    /// `a|b|c`: cada alternativa, menos a última, é precedida de um `Split` para a próxima
+    /// e termina num `Jmp` para o fim; a ordem das tentativas é a da escrita.
+    fn alt(&mut self, alts: &[Node]) {
+        let mut jumps = Vec::new();
+        for (i, alt) in alts.iter().enumerate() {
+            if i + 1 == alts.len() {
+                self.node(alt);
+                break;
+            }
+            let split = self.prog.len();
+            self.prog.push(Inst::Split(0));
+            self.node(alt);
+            jumps.push(self.prog.len());
+            self.prog.push(Inst::Jmp(0));
+            self.prog[split] = Inst::Split(self.prog.len());
+        }
+        let end = self.prog.len();
+        for j in jumps {
+            self.prog[j] = Inst::Jmp(end);
+        }
+    }
+
+    /// Repetição de `inner`: um átomo de um caractere vira `RepOne`; o resto, um laço com
+    /// contador (sem desenrolar, para que `(ab){1000000}` não gaste memória).
+    fn repeat(&mut self, inner: &Node, min: usize, max: Option<usize>, greedy: bool) {
+        if let Some(atom) = single(inner) {
+            self.prog.push(Inst::RepOne(Box::new(atom), min, max, greedy));
+            return;
+        }
+        let (count, start) = (self.regs, self.regs + 1);
+        self.regs += 2;
+        self.prog.push(Inst::Zero(count));
+        let head = self.prog.len();
+        self.prog.push(Inst::Loop(count, min, max, greedy, 0));
+        self.prog.push(Inst::Save(start));
+        self.node(inner);
+        self.prog.push(Inst::LoopEnd(count, start, head));
+        self.prog[head] = Inst::Loop(count, min, max, greedy, self.prog.len());
+    }
+}
+
 struct Matcher<'r> {
     text: &'r [char],
     ci: bool,
     steps: usize,
-    depth: usize,
-    caps: Vec<Option<(usize, usize)>>,
+    regs: Vec<u32>,
+    stack: Vec<Frame>,
 }
 
 impl Matcher<'_> {
@@ -304,218 +438,178 @@ impl Matcher<'_> {
         hit(c) || (self.ci && (c.to_lowercase().any(hit) || c.to_uppercase().any(hit)))
     }
 
-    /// Tenta casar `node` em `pos` e continua com `k`; devolve a posição final.
-    fn m(
-        &mut self,
-        node: &Node,
-        pos: usize,
-        k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
-    ) -> Option<usize> {
-        self.steps += 1;
-        if self.depth >= MAX_DEPTH {
-            self.steps = MAX_STEPS + 1; // fundo demais: abandona a busca inteira
-        }
-        if self.steps > MAX_STEPS {
-            return None;
-        }
-        self.depth += 1;
-        let r = match node {
-            Node::Char(c) => {
-                if pos < self.text.len() && self.eq(self.text[pos], *c) {
-                    k(self, pos + 1)
-                } else {
-                    None
-                }
-            }
-            Node::Any => {
-                if pos < self.text.len() && self.text[pos] != '\n' {
-                    k(self, pos + 1)
-                } else {
-                    None
-                }
-            }
-            Node::Class(ranges, negated) => {
-                if pos < self.text.len() && self.in_class(self.text[pos], ranges) != *negated {
-                    k(self, pos + 1)
-                } else {
-                    None
-                }
-            }
-            Node::Start => (pos == 0).then(|| k(self, pos)).flatten(),
-            Node::End => (pos == self.text.len()).then(|| k(self, pos)).flatten(),
-            Node::WordBoundary(want) => {
-                let before = pos > 0 && is_word(self.text[pos - 1]);
-                let after = pos < self.text.len() && is_word(self.text[pos]);
-                ((before != after) == *want).then(|| k(self, pos)).flatten()
-            }
-            Node::Group(inner, cap) => {
-                let cap = *cap;
-                let saved = cap.and_then(|i| self.caps[i]);
-                let r = self.m(inner, pos, &mut |me, end| {
-                    if let Some(i) = cap {
-                        let prev = me.caps[i];
-                        me.caps[i] = Some((pos, end));
-                        let r = k(me, end);
-                        if r.is_none() {
-                            me.caps[i] = prev;
-                        }
-                        r
-                    } else {
-                        k(me, end)
-                    }
-                });
-                if r.is_none() {
-                    if let Some(i) = cap {
-                        self.caps[i] = saved;
-                    }
-                }
-                r
-            }
-            Node::Alt(alts) => {
-                let mut r = None;
-                for a in alts {
-                    r = self.m(a, pos, k);
-                    if r.is_some() {
-                        break;
-                    }
-                }
-                r
-            }
-            Node::Seq(items) => self.seq(items, pos, k),
-            Node::Repeat(inner, min, max, greedy) => {
-                if matches!(**inner, Node::Char(_) | Node::Any | Node::Class(..)) {
-                    self.repeat_one(inner, *min, *max, *greedy, pos, k)
-                } else {
-                    self.repeat(inner, *min, *max, *greedy, pos, 0, k)
-                }
-            }
-        };
-        self.depth -= 1;
-        r
-    }
-
-    /// `node` (`Char`, `Any` ou `Class`) casa o caractere em `pos`?
-    fn one(&self, node: &Node, pos: usize) -> bool {
+    /// `inst` (`Char`, `Any` ou `Class`) casa o caractere em `pos`?
+    fn one(&self, inst: &Inst, pos: usize) -> bool {
         let Some(&c) = self.text.get(pos) else {
             return false;
         };
-        match node {
-            Node::Char(x) => self.eq(c, *x),
-            Node::Any => c != '\n',
-            Node::Class(ranges, negated) => self.in_class(c, ranges) != *negated,
+        match inst {
+            Inst::Char(x) => self.eq(c, *x),
+            Inst::Any => c != '\n',
+            Inst::Class(ranges, negated) => self.in_class(c, ranges) != *negated,
             _ => false,
         }
     }
 
-    /// `repeat` para átomos de um caractere, em laço: `.*` e `\w+` não gastam pilha por
-    /// caractere. Mesma ordem de tentativas de `repeat`/`more`.
-    fn repeat_one(
+    fn push_choice(&mut self, pc: usize, pos: usize) {
+        self.stack.push(Frame::Choice(pc as u32, pos as u32));
+    }
+
+    /// Escreve um registrador guardando o valor antigo na pilha: o retrocesso o desfaz.
+    fn set(&mut self, reg: usize, val: u32) {
+        let frame = Frame::Restore(reg as u32, self.regs[reg]);
+        self.stack.push(frame);
+        self.regs[reg] = val;
+    }
+
+    /// Executa o programa a partir de `start` e devolve o fim do primeiro casamento, na
+    /// ordem de preferência (gulosos e alternativas pela ordem escrita). Cada passo conta
+    /// em `steps`; passou de `MAX_STEPS` (ou de `MAX_FRAMES`), a busca é abandonada.
+    fn run(&mut self, prog: &[Inst], start: usize) -> Option<usize> {
+        self.stack.clear();
+        let (mut pc, mut pos) = (0, start);
+        loop {
+            self.steps += 1;
+            if self.steps > MAX_STEPS || self.stack.len() > MAX_FRAMES {
+                self.steps = MAX_STEPS + 1; // fundo demais: abandona a busca inteira
+                return None;
+            }
+            // `Some((instrução, posição))` segue adiante; `None` é falha e retrocede.
+            let next = match &prog[pc] {
+                Inst::Match => return Some(pos),
+                Inst::Start => (pos == 0).then_some((pc + 1, pos)),
+                Inst::End => (pos == self.text.len()).then_some((pc + 1, pos)),
+                Inst::WordBoundary(want) => {
+                    let before = pos > 0 && is_word(self.text[pos - 1]);
+                    let after = pos < self.text.len() && is_word(self.text[pos]);
+                    ((before != after) == *want).then_some((pc + 1, pos))
+                }
+                Inst::Split(alt) => {
+                    self.push_choice(*alt, pos);
+                    Some((pc + 1, pos))
+                }
+                Inst::Jmp(to) => Some((*to, pos)),
+                Inst::Save(reg) => {
+                    self.set(*reg, pos as u32);
+                    Some((pc + 1, pos))
+                }
+                Inst::Zero(reg) => {
+                    self.set(*reg, 0);
+                    Some((pc + 1, pos))
+                }
+                Inst::Loop(count, min, max, greedy, exit) => {
+                    let n = self.regs[*count] as usize;
+                    let can_more = max.is_none_or(|m| n < m);
+                    if n < *min {
+                        Some((pc + 1, pos))
+                    } else if !can_more {
+                        Some((*exit, pos))
+                    } else if *greedy {
+                        self.push_choice(*exit, pos);
+                        Some((pc + 1, pos))
+                    } else {
+                        self.push_choice(pc + 1, pos);
+                        Some((*exit, pos))
+                    }
+                }
+                Inst::LoopEnd(count, begin, head) => {
+                    if pos == self.regs[*begin] as usize {
+                        None
+                    } else {
+                        self.set(*count, self.regs[*count] + 1);
+                        Some((*head, pos))
+                    }
+                }
+                Inst::RepOne(atom, min, max, greedy) => {
+                    self.rep_one(pc, atom, *min, *max, *greedy, pos)
+                }
+                // `Char`, `Any` e `Class`.
+                consume => self.one(consume, pos).then_some((pc + 1, pos + 1)),
+            };
+            (pc, pos) = next.or_else(|| self.backtrack(prog))?;
+        }
+    }
+
+    /// `RepOne` em `pc`: laço de átomo único, sem pilha nativa nem uma moldura por
+    /// caractere. Tenta primeiro o mais longo (guloso) ou o mais curto (preguiçoso).
+    fn rep_one(
         &mut self,
-        inner: &Node,
+        pc: usize,
+        atom: &Inst,
         min: usize,
         max: Option<usize>,
         greedy: bool,
         pos: usize,
-        k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let limit = max.map_or(usize::MAX, |m| m.max(min));
-        let mut n = 0;
         if greedy {
-            while n < limit && self.one(inner, pos + n) {
+            let mut n = 0;
+            while n < limit && self.one(atom, pos + n) {
                 n += 1;
             }
             self.steps += n;
             if n < min {
                 return None;
             }
-            // Do mais longo para o mais curto.
-            loop {
-                if let Some(r) = k(self, pos + n) {
-                    return Some(r);
-                }
-                if n == min {
-                    return None;
-                }
-                n -= 1;
+            if n > min {
+                // Do mais longo para o mais curto: `n` agora, depois `n - 1` até `min`.
+                let (next, below, floor) = (pc as u32 + 1, pos + n - 1, pos + min);
+                let frame = Frame::Greedy(next, below as u32, floor as u32);
+                self.stack.push(frame);
             }
+            return Some((pc + 1, pos + n));
         }
-        loop {
-            if n >= min {
-                if let Some(r) = k(self, pos + n) {
-                    return Some(r);
-                }
-            }
-            if n >= limit || !self.one(inner, pos + n) {
-                return None;
-            }
-            self.steps += 1;
-            n += 1;
+        if !(0..min).all(|i| self.one(atom, pos + i)) {
+            return None;
         }
+        self.steps += min;
+        let cur = pos + min;
+        let end = pos.saturating_add(limit).min(self.text.len());
+        if cur < end {
+            let frame = Frame::Lazy(pc as u32, cur as u32, end as u32);
+            self.stack.push(frame);
+        }
+        Some((pc + 1, cur))
     }
 
-    fn seq(
-        &mut self,
-        items: &[Node],
-        pos: usize,
-        k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
-    ) -> Option<usize> {
-        match items.split_first() {
-            None => k(self, pos),
-            Some((first, rest)) => self.m(first, pos, &mut |me, p| me.seq(rest, p, k)),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn repeat(
-        &mut self,
-        inner: &Node,
-        min: usize,
-        max: Option<usize>,
-        greedy: bool,
-        pos: usize,
-        count: usize,
-        k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
-    ) -> Option<usize> {
-        let can_more = max.is_none_or(|m| count < m);
-        if count < min {
-            return self.more(inner, min, max, greedy, pos, count, k);
-        }
-        if greedy {
-            if can_more {
-                if let Some(r) = self.more(inner, min, max, greedy, pos, count, k) {
-                    return Some(r);
+    /// Desfaz a pilha até o ponto de escolha mais recente e devolve onde retomar
+    /// (`None`: acabaram as alternativas).
+    fn backtrack(&mut self, prog: &[Inst]) -> Option<(usize, usize)> {
+        while let Some(frame) = self.stack.pop() {
+            match frame {
+                Frame::Restore(reg, old) => self.regs[reg as usize] = old,
+                Frame::Choice(pc, pos) => return Some((pc as usize, pos as usize)),
+                Frame::Greedy(pc, pos, floor) => {
+                    if pos > floor {
+                        self.stack.push(Frame::Greedy(pc, pos - 1, floor));
+                    }
+                    return Some((pc as usize, pos as usize));
+                }
+                Frame::Lazy(pc, pos, end) => {
+                    if let Inst::RepOne(atom, ..) = &prog[pc as usize] {
+                        if self.one(atom, pos as usize) {
+                            self.steps += 1;
+                            if pos + 1 < end {
+                                self.stack.push(Frame::Lazy(pc, pos + 1, end));
+                            }
+                            return Some((pc as usize + 1, pos as usize + 1));
+                        }
+                    }
                 }
             }
-            k(self, pos)
-        } else {
-            if let Some(r) = k(self, pos) {
-                return Some(r);
-            }
-            if can_more {
-                self.more(inner, min, max, greedy, pos, count, k)
-            } else {
-                None
-            }
         }
+        None
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn more(
-        &mut self,
-        inner: &Node,
-        min: usize,
-        max: Option<usize>,
-        greedy: bool,
-        pos: usize,
-        count: usize,
-        k: &mut dyn FnMut(&mut Self, usize) -> Option<usize>,
-    ) -> Option<usize> {
-        self.m(inner, pos, &mut |me, p| {
-            if p == pos {
-                return None; // repetição vazia: evita laço infinito
-            }
-            me.repeat(inner, min, max, greedy, p, count + 1, k)
-        })
+    /// Capturas do casamento `(start, end)`; o grupo 0 é o casamento inteiro.
+    fn captures(&self, groups: usize, start: usize, end: usize) -> Vec<Option<(usize, usize)>> {
+        let mut caps = vec![Some((start, end))];
+        for g in 1..=groups {
+            let (a, b) = (self.regs[2 * g], self.regs[2 * g + 1]);
+            let set = a != NONE && b != NONE;
+            caps.push(set.then_some((a as usize, b as usize)));
+        }
+        caps
     }
 }
 
@@ -532,8 +626,15 @@ impl Regex {
         if p.pos < p.chars.len() {
             return Err(p.err("parêntese a mais"));
         }
+        let mut compiler = Compiler {
+            prog: Vec::new(),
+            regs: 2 * (p.groups + 1),
+        };
+        compiler.node(&root);
+        compiler.prog.push(Inst::Match);
         Ok(Self {
-            root,
+            prog: compiler.prog,
+            regs: compiler.regs,
             groups: p.groups,
             ci: flags.contains('i'),
         })
@@ -555,21 +656,23 @@ impl Regex {
             text,
             ci: self.ci,
             steps: 0,
-            depth: 0,
-            caps: vec![None; self.groups + 1],
+            regs: vec![NONE; self.regs],
+            stack: Vec::new(),
         };
+        // Só as capturas precisam voltar a `NONE`: os registradores dos laços são
+        // sempre escritos (`Zero`/`Save`) antes de lidos.
+        let cap_regs = 2 * (self.groups + 1);
         for s in start..=text.len() {
             m.steps = 0;
-            m.caps.fill(None);
-            let found = m.m(&self.root, s, &mut |_, e| Some(e));
+            m.regs[..cap_regs].fill(NONE);
+            let found = m.run(&self.prog, s);
             // Busca cortada pelo limite: um `Some` aqui seria um casamento truncado.
             if m.steps > MAX_STEPS || m.steps > *budget {
                 return None;
             }
             *budget -= m.steps;
             if let Some(end) = found {
-                m.caps[0] = Some((s, end));
-                return Some((s, end, m.caps));
+                return Some((s, end, m.captures(self.groups, s, end)));
             }
         }
         None
@@ -690,5 +793,51 @@ mod tests {
         assert!(re.find_from(&text, 0, &mut small).is_none());
         let found = re.find_from(&text, 0, &mut large);
         assert_eq!(found.map(|(s, e, _)| (s, e)), Some((101, 103)));
+    }
+
+    fn find(p: &str, t: &str) -> Match {
+        let chars: Vec<char> = t.chars().collect();
+        Regex::new(p, "").unwrap().find_at(&chars, 0).unwrap()
+    }
+
+    #[test]
+    fn long_inputs_have_no_depth_limit() {
+        let ab = "ab".repeat(10_000);
+        assert!(m("(ab)*c", &format!("{ab}c")));
+        assert!(!m("^(ab)*c", &ab));
+        assert!(m("^(a|b)+$", &ab.repeat(2)));
+        let literal = "ab".repeat(1_000);
+        assert!(m(&format!("^{literal}$"), &literal));
+        assert!(!m(&format!("^{literal}$"), &format!("{literal}x")));
+    }
+
+    #[test]
+    fn pathological_patterns_return() {
+        let long = "a".repeat(50_000);
+        assert!(!m("(a*)*b", &long));
+        assert!(m("(a|aa)+$", &long));
+    }
+
+    #[test]
+    fn captures_and_lazy_quantifiers() {
+        let (s, e, caps) = find("(a)(b)?", "ab");
+        assert_eq!((s, e), (0, 2));
+        assert_eq!(caps, vec![Some((0, 2)), Some((0, 1)), Some((1, 2))]);
+        let (s, e, caps) = find("(a)(b)?", "ac");
+        assert_eq!((s, e), (0, 1));
+        assert_eq!(caps, vec![Some((0, 1)), Some((0, 1)), None]);
+        let (s, e, _) = find("a+?b", "aaab");
+        assert_eq!((s, e), (0, 4));
+        assert_eq!(find("a+?", "aaa").1, 1);
+        assert_eq!(find("a{2,3}?", "aaaa").1, 2);
+        assert_eq!(find("a{2,3}", "aaaa").1, 3);
+        // A ordem das alternativas decide, e uma volta vazia não vira captura.
+        let (_, e, caps) = find("(a|ab)(c|bcd)(d*)", "abcd");
+        assert_eq!(e, 4);
+        let want = vec![Some((0, 4)), Some((0, 1)), Some((1, 4)), Some((4, 4))];
+        assert_eq!(caps, want);
+        let (_, e, caps) = find("(a*)*", "aa");
+        assert_eq!(e, 2);
+        assert_eq!(caps, vec![Some((0, 2)), Some((0, 2))]);
     }
 }

@@ -99,9 +99,13 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
   recebem `403`, o que barra também o `POST` "simples" (formulário, `fetch` sem
   preflight). `MINIDB_CORS_ORIGIN` libera uma única origem (`*` libera todas). Isso não
   impede clientes diretos (sem `Origin`) e não autentica: **sem `token` nem usuários o
-  banco está em modo aberto**, e qualquer processo local acessa a API; um ataque de
-  DNS rebinding contra o modo aberto ainda lê por `GET` (não há checagem de `Host`).
-  Defina token ou usuários sempre que o bind não for estritamente local. O TCP de
+  banco está em modo aberto**, e qualquer processo local acessa a API. Contra DNS
+  rebinding (uma página que aponta um nome dela para `127.0.0.1` e lê por `GET`), o
+  servidor confere o cabeçalho `Host` em toda rota, exceto `/health` e `/v1/health`:
+  aceita ausente, IP literal, nomes sem ponto (`localhost`, serviço do docker-compose),
+  `*.localhost` e os de `MINIDB_ALLOWED_HOSTS` (lista separada por vírgula; `*` desliga
+  a checagem); outro nome recebe `403`. Atrás de proxy reverso ou com domínio próprio,
+  liste o nome em `MINIDB_ALLOWED_HOSTS`. Defina token ou usuários sempre que o bind não for estritamente local. O TCP de
   linhas encerra a conexão ao receber uma linha de requisição HTTP (`MÉTODO alvo
   HTTP/1.x`; um navegador não consegue usá-lo como transporte de comandos).
 - HTTP limita cabeçalho a 32 KiB, corpo a `max_body_bytes` (padrão: o suficiente para

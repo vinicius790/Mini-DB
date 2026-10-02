@@ -139,18 +139,41 @@ fn regex_compiler_and_matcher_never_panic() {
     assert!(Regex::new("[[:]", "").is_err());
     assert!(Regex::new("[[:alpha:]]+", "").unwrap().is_match("abc"));
     assert!(!Regex::new("^[[:digit:]]+$", "").unwrap().is_match("abc"));
-    // Texto no tamanho máximo: `.*` não pode gastar pilha por caractere, e um grupo
-    // repetido tem de desistir (profundidade limitada) em vez de estourar a pilha.
+    // Texto no tamanho máximo: o casador usa uma pilha de retrocesso no heap, então nem
+    // `.*` nem um grupo repetido gastam pilha nativa por caractere ou por volta.
     let long = "a".repeat(50_000);
     assert!(Regex::new("^.*$", "").unwrap().is_match(&long));
-    let _ = Regex::new("(a)*$", "").unwrap().is_match(&long);
-    let _ = Regex::new("^((a|b))+c", "").unwrap().is_match(&long);
+    assert!(Regex::new("(a)*$", "").unwrap().is_match(&long));
+    assert!(!Regex::new("^((a|b))+c", "").unwrap().is_match(&long));
     // Orçamento da varredura: uma busca quadrática legítima (`[a-z]+` recua em cada uma
     // das 5 mil posições, uns 2,5e7 passos) ainda casa; as patológicas desistem logo.
     let letters = format!("{} foo1", "a".repeat(5_000));
     assert!(Regex::new("[a-z]+\\d", "").unwrap().is_match(&letters));
-    let _ = Regex::new("(a|aa)+$", "").unwrap().is_match(&long);
-    let _ = Regex::new("(a*)*b", "").unwrap().is_match(&long);
+    // `(a|aa)+$` casa sem recuar; em `(a*)*b` (sem 'b' no texto) o orçamento de passos
+    // corta a busca exponencial.
+    assert!(Regex::new("(a|aa)+$", "").unwrap().is_match(&long));
+    assert!(!Regex::new("(a*)*b", "").unwrap().is_match(&long));
+}
+
+#[test]
+fn regex_has_no_practical_depth_limit() {
+    use mini_db::rel::regex::Regex;
+    let re = |p: &str| Regex::new(p, "").unwrap();
+    // Grupo repetido milhares de vezes e padrão com milhares de átomos em sequência.
+    let ab = "ab".repeat(10_000);
+    assert!(re("(ab)*c").is_match(&format!("{ab}c")));
+    assert!(re("^(a|b)+$").is_match(&ab.repeat(2)));
+    let literal = "ab".repeat(1_000);
+    let exact = re(&format!("^{literal}$"));
+    assert!(exact.is_match(&literal));
+    assert!(!exact.is_match(&format!("{literal}x")));
+    // Capturas e preguiça seguem a mesma ordem de tentativas de sempre.
+    let chars: Vec<char> = "ab".chars().collect();
+    let (_, _, caps) = re("(a)(b)?").find_at(&chars, 0).unwrap();
+    assert_eq!(caps, vec![Some((0, 2)), Some((0, 1)), Some((1, 2))]);
+    let chars: Vec<char> = "aaab".chars().collect();
+    let (start, end, _) = re("a+?b").find_at(&chars, 0).unwrap();
+    assert_eq!((start, end), (0, 4));
 }
 
 #[test]

@@ -138,6 +138,24 @@ de autorizar `Content-Type` e `Authorization`. Preflight para rota inexistente r
 clientes não-browser; sem token nem usuários a API continua aberta a qualquer processo
 local, então defina `token` ou crie usuários.
 
+### Cabeçalho `Host` (DNS rebinding)
+
+Uma página web pode apontar um nome DNS dela para `127.0.0.1` e então ler (`GET`) a API
+local como se fosse da mesma origem. Por isso o servidor confere o cabeçalho `Host`
+(sem a porta) de toda rota, exceto `/health` e `/v1/health`, que seguem públicas. São
+aceitos: `Host` ausente (clientes HTTP/1.0), IP literal (`127.0.0.1`, `[::1]`), nomes
+sem ponto (`localhost`, e o nome de serviço do docker-compose, como `minidb`; um
+domínio que um atacante registra sempre tem ponto), `*.localhost` e os nomes de
+`MINIDB_ALLOWED_HOSTS`. Qualquer outro nome recebe `403` com uma mensagem que cita essa
+variável; dois cabeçalhos `Host` recebem `400`.
+
+`MINIDB_ALLOWED_HOSTS` é uma lista separada por vírgula (`db.exemplo.com,painel.exemplo.com`),
+comparada sem diferenciar maiúsculas de minúsculas e sem a porta, lida uma vez por
+processo. `MINIDB_ALLOWED_HOSTS=*` desliga a checagem. **Atrás de proxy reverso ou com um
+nome de domínio** (`db.exemplo.com`), liste o nome que o cliente usa, ou o proxy deve
+reescrever o `Host` para um nome aceito. Acesso por IP ou pela porta publicada
+(`localhost:8080`) não precisa de configuração.
+
 Status usados: `200` para operações concluídas, `400` também para erros de
 validação vindos do motor (ex.: restrição violada), `401` sem token válido, `403`
 para escrita em réplica somente leitura, privilégio ausente ou `Origin` não liberada,

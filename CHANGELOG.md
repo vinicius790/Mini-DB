@@ -2,6 +2,14 @@
 
 ## Não lançado (correções pós-1.3.0)
 
+COPY
+- PostgreSQL: `COPY tabela [(colunas)] FROM STDIN`, `COPY tabela [(colunas)] TO STDOUT` e
+  `COPY (SELECT ...) TO STDOUT` no formato texto (`DELIMITER`, `NULL`, escapes, `\.`),
+  com `CopyInResponse`/`CopyOutResponse`/`CopyData`/`CopyDone`/`CopyFail`. O `FROM` aplica
+  tudo numa transação só, com os privilégios de `INSERT` (e `SELECT` no `TO`); limite de
+  256 MiB e 1.000.000 de linhas por `COPY FROM`. `CopyData` solto fora de um `COPY` passou
+  a ser ignorado (antes dava erro). CSV e BINARY seguem fora.
+
 Segurança
 - HTTP não envia mais `Access-Control-Allow-Origin: *`; `MINIDB_CORS_ORIGIN` libera uma
   origem. O TCP de linhas encerra a conexão ao receber uma requisição HTTP e volta a
@@ -17,6 +25,10 @@ Segurança
   redução módulo L do Ed25519 sem desvios dependentes de segredo.
 - HTTP recusa (`403`) `POST`/`PUT`/`DELETE` com `Origin` diferente da origem liberada:
   uma página qualquer não escreve mais na API local por `POST` sem preflight.
+- HTTP confere o cabeçalho `Host` contra DNS rebinding (leituras por `GET` incluídas):
+  aceita ausente, IP literal, nomes sem ponto, `localhost`/`*.localhost` e os de
+  `MINIDB_ALLOWED_HOSTS` (`*` desliga); outro nome recebe `403`, exceto em `/health` e
+  `/v1/health`. Atrás de proxy ou com domínio próprio, liste o nome na variável.
 - Autorização: subconsulta em `LIMIT`/`OFFSET` é conferida; `RETURNING` exige `SELECT`
   na tabela; `ALL` dividido entre concessão direta e papel é somado.
 - PostgreSQL: mensagens antes da autenticação limitadas a 64 KiB; conexão aberta sem

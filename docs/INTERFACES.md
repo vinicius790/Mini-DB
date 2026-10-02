@@ -140,6 +140,20 @@ claro comparada ao `token` quando só há token; `trust` num banco sem usuários
 `RESET`, `DISCARD`, `DEALLOCATE` e `SHOW parâmetro` são aceitos como no-op para os
 clientes.
 
+**COPY** (consulta simples, formato texto): `COPY tabela [(colunas)] FROM STDIN`,
+`COPY tabela [(colunas)] TO STDOUT` e `COPY (SELECT ...) TO STDOUT`, com `[WITH]
+[(]FORMAT text, DELIMITER 'x', NULL 'x'[)]`. Delimitador padrão TAB, NULL como `\N`,
+escapes `\\ \n \r \t \b \f \v`, `\NNN` e `\xHH`; a linha `\.` encerra os dados. O `FROM
+STDIN` exige `INSERT` na tabela e o `TO STDOUT` exige `SELECT` (conferidos como num
+`INSERT`/`SELECT` comum); os dados são aplicados por `INSERT` parametrizados de 500
+linhas numa única transação (a do cliente, se aberta; senão uma própria): `CopyFail`,
+linha malformada ou violação de restrição devolvem `ErrorResponse` e nada fica gravado.
+Os valores chegam como texto e o motor converte para o tipo da coluna. Limites por
+`COPY FROM`: 256 MiB de dados e 1.000.000 de linhas. Não há CSV, BINARY, arquivo/`PROGRAM`
+nem `COPY` no protocolo estendido; o `COPY` precisa ser o único comando da mensagem
+`Query`. Um erro antes do `CopyInResponse` (tabela ou coluna inexistente, sem privilégio)
+é devolvido na hora; `CopyData` fora de um `COPY` é ignorado, como no PostgreSQL.
+
 **TLS 1.3 nativo** (1.1): com `tls = true` (padrão) o servidor aceita `SSLRequest` e
 negocia TLS 1.3 (X25519, ChaCha20-Poly1305, Ed25519) sem dependências. Na primeira
 execução gera `tls.key` (PKCS#8 Ed25519) e `tls.crt` (X.509 autoassinado, SAN com o
@@ -196,7 +210,7 @@ existem como relações vazias, para os clientes não falharem. Funções: `pg_g
 `unnest` (inclusive `WITH ORDINALITY`) no FROM, `x = ANY(array)`, `arr[i]`. Os
 metacomandos do psql funcionam: `\dt`, `\d tabela` (colunas, índices, **FKs, "Referenced
 by", gatilhos, CHECK**), `\d+`, `\di`, `\dv`, `\du`, `\l`, `\dn`, `\dt+`, `\df`, `\do`,
-`\dC`, `\dx`, `\dF`, `\dA`, `\dp`... Não há `COPY` nem cursores parciais. Vetores, JSON e
+`\dC`, `\dx`, `\dF`, `\dA`, `\dp`... Não há cursores parciais (`COPY`: ver acima). Vetores, JSON e
 datas trafegam como texto. `LISTEN canal` funciona: as notificações (`NOTIFY`) chegam
 como `NotificationResponse` junto da resposta do comando seguinte (o psql as mostra como
 "Asynchronous notification"); não há envio espontâneo com a conexão ociosa.
@@ -214,7 +228,9 @@ No browser, o cliente TypeScript envia `Content-Type: application/json`, o que c
 preflight CORS. Por padrão o servidor não envia cabeçalhos CORS e recusa (`403`)
 escritas com `Origin` não liberado, então o navegador bloqueia o cliente; libere a
 origem do painel com `MINIDB_CORS_ORIGIN`. CORS não autentica nem substitui token ou
-usuários. Para detalhes dos campos, status e comportamento do scan, veja [HTTP.md](HTTP.md).
+usuários. O servidor também recusa (`403`) um `Host` com nome de domínio que não esteja
+em `MINIDB_ALLOWED_HOSTS` (defesa contra DNS rebinding); `localhost`, IPs e nomes sem
+ponto passam. Para detalhes dos campos, status e comportamento do scan, veja [HTTP.md](HTTP.md).
 
 ## ABI C
 

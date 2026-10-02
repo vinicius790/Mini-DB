@@ -309,6 +309,7 @@ fn handle(
         body,
         auth,
         origin,
+        host,
     } = match read_request(stream, opts.max_body_bytes) {
         Ok(request) => request,
         Err(error) => {
@@ -330,7 +331,16 @@ fn handle(
         }
     }
     let (path, query) = split_target(&target);
-    let public = method == "OPTIONS" || matches!(path.as_str(), "/health" | "/v1/health");
+    let health = matches!(path.as_str(), "/health" | "/v1/health");
+    // Contra DNS rebinding: uma página pode apontar um nome dela para 127.0.0.1 e ler a
+    // API como "mesma origem". O `Host` revela o nome usado; nomes de fora são recusados.
+    if !health && !host_allowed(host.as_deref(), allowed_hosts()) {
+        let name = host.as_deref().unwrap_or_default();
+        return Err(Error::Forbidden(format!(
+            "nome de host {name} não liberado; defina MINIDB_ALLOWED_HOSTS para liberá-lo"
+        )));
+    }
+    let public = method == "OPTIONS" || health;
     // `Authorization: Basic base64(usuário:senha)` → principal com privilégios.
     let basic = auth
         .as_deref()
@@ -908,6 +918,8 @@ struct Request {
     auth: Option<String>,
     /// Cabeçalho `Origin`, se houver (requisição feita por uma página web).
     origin: Option<String>,
+    /// Cabeçalho `Host` (com a porta, se houver).
+    host: Option<String>,
 }
 
 /// Socket HTTP em claro (`TcpStream`) ou TLS.
@@ -953,6 +965,7 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
                     body: String::new(),
                     auth: None,
                     origin: None,
+                    host: None,
                 });
             }
             return Err(Error::Other("requisição HTTP incompleta".into()));
@@ -993,6 +1006,7 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
     let mut content_len = 0usize;
     let mut auth = None;
     let mut origin = None;
+    let mut host = None;
     let mut has_content_len = false;
     let mut has_transfer_encoding = false;
     for line in lines {
@@ -1020,6 +1034,11 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
             auth = Some(value.trim().to_string());
         } else if name.eq_ignore_ascii_case("origin") {
             origin = Some(value.trim().to_string());
+        } else if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return Err(Error::Other("cabeçalho Host duplicado".into()));
+            }
+            host = Some(value.trim().to_string());
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
             if has_transfer_encoding || has_content_len {
                 return Err(Error::Other("framing HTTP ambíguo".into()));
@@ -1050,6 +1069,7 @@ fn read_request(stream: &mut dyn HttpIo, max_body: usize) -> Result<Request> {
         body,
         auth,
         origin,
+        host,
     })
 }
 
@@ -1095,6 +1115,51 @@ fn cors_origin() -> &'static str {
         Ok(origin) if !origin.contains(['\r', '\n']) => origin,
         _ => String::new(),
     })
+}
+
+/// Nomes de host liberados por `MINIDB_ALLOWED_HOSTS` (separados por vírgula), lidos uma
+/// vez. `*` desliga a checagem de `Host`.
+fn allowed_hosts() -> &'static str {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| std::env::var("MINIDB_ALLOWED_HOSTS").unwrap_or_default())
+}
+
+/// Nome do `Host` sem a porta, sem os colchetes de um IPv6 (`[::1]:80` vira `::1`) e sem
+/// o ponto final (`exemplo.com.` vira `exemplo.com`).
+fn host_name(host: &str) -> &str {
+    let host = host.trim();
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => host.split_once(':').map_or(host, |(name, _)| name),
+    };
+    name.trim_end_matches('.')
+}
+
+/// Decide se o cabeçalho `Host` é aceito (defesa contra DNS rebinding). Passam: ausente
+/// (HTTP/1.0), IP literal, nome sem ponto (`localhost`, serviço do docker-compose: um
+/// domínio que um atacante registra sempre tem ponto), `*.localhost` e os nomes de
+/// `allowed` (lista separada por vírgula, sem diferenciar caixa; `*` libera tudo).
+fn host_allowed(host: Option<&str>, allowed: &str) -> bool {
+    let host = match host {
+        Some(host) => host,
+        None => return true,
+    };
+    if allowed.split(',').any(|item| item.trim() == "*") {
+        return true;
+    }
+    let name = host_name(host).to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    if name.parse::<std::net::IpAddr>().is_ok() || !name.contains('.') {
+        return true;
+    }
+    if name.ends_with(".localhost") {
+        return true;
+    }
+    allowed
+        .split(',')
+        .any(|item| host_name(item).eq_ignore_ascii_case(&name))
 }
 
 /// Cabeçalhos CORS (já com `\r\n` no fim). Por padrão não há nenhum: o navegador
@@ -1372,8 +1437,8 @@ fn exec_json_value(result: ExecResult) -> Json {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle, hex_decode, hex_encode, percent_decode, qget, read_request, validate_query,
-        write_http, Metrics, OPENAPI_MIN,
+        handle, hex_decode, hex_encode, host_allowed, percent_decode, qget, read_request,
+        validate_query, write_http, Metrics, OPENAPI_MIN,
     };
     use crate::config::NetOptions;
     use crate::json::Json;
@@ -1614,6 +1679,56 @@ mod tests {
         db.write().unwrap().close().unwrap();
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn host_header_blocks_dns_rebinding() {
+        // Supõe `MINIDB_ALLOWED_HOSTS` ausente, como no CI.
+        let dir = std::env::temp_dir().join(format!("minidb-http-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = SharedDb::new(Db::open(&dir).unwrap());
+        let get = |host: &str| {
+            let request = format!("GET /v1/kv?key=k HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            response_for(&db, request.as_bytes())
+        };
+        for host in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080", "minidb"] {
+            let ok = get(host);
+            assert!(ok.starts_with("HTTP/1.1 200 "), "{host}: {ok}");
+        }
+        let refused = get("evil.example");
+        assert!(refused.starts_with("HTTP/1.1 403 "), "{refused}");
+        assert!(refused.contains("MINIDB_ALLOWED_HOSTS"), "{refused}");
+        let health = response_for(
+            &db,
+            b"GET /v1/health HTTP/1.1\r\nHost: rebinding.example\r\n\r\n",
+        );
+        assert!(health.starts_with("HTTP/1.1 200 "), "{health}");
+        db.write().unwrap().close().unwrap();
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn host_allowed_rules() {
+        assert!(host_allowed(None, ""));
+        assert!(host_allowed(Some("127.0.0.1"), ""));
+        assert!(host_allowed(Some("[::1]:8080"), ""));
+        assert!(host_allowed(Some("LocalHost:8080"), ""));
+        assert!(host_allowed(Some("app.localhost"), ""));
+        assert!(host_allowed(Some("minidb:8080"), ""));
+        assert!(!host_allowed(Some("evil.example"), ""));
+        assert!(!host_allowed(Some("evil.example:8080"), ""));
+        assert!(!host_allowed(Some("evil.example."), ""));
+        assert!(!host_allowed(Some("127.0.0.1.evil.example"), ""));
+        assert!(!host_allowed(Some("localhost.evil.example"), ""));
+        assert!(!host_allowed(Some(""), ""));
+        assert!(!host_allowed(Some(":8080"), ""));
+        let list = "db.exemplo.com, Painel.Exemplo.com:443";
+        assert!(host_allowed(Some("db.exemplo.com:8080"), list));
+        assert!(host_allowed(Some("painel.exemplo.com"), list));
+        assert!(!host_allowed(Some("evil.example"), list));
+        assert!(host_allowed(Some("evil.example"), "a.com,*"));
+        assert!(host_allowed(Some(""), "*"));
     }
 
     #[test]
