@@ -880,3 +880,37 @@ fn hash_join_matches_numeric_text_with_numbers() {
     let sql = "SELECT a.id, b.id FROM hj_n a JOIN hj_t b ON b.s = a.v ORDER BY a.id, b.id";
     assert_eq!(q(&mut db, sql), ["1|1", "1|2", "2|4"]);
 }
+
+#[test]
+fn deep_expression_child() {
+    // Só faz algo quando o teste abaixo o chama num subprocesso.
+    let Ok(links) = std::env::var("MINIDB_DEEP_LINKS") else {
+        return;
+    };
+    let links: usize = links.parse().unwrap();
+    let mut db = Db::open(tmpdir("deep-child")).unwrap();
+    ok(&mut db, "CREATE TABLE deep (x INT)");
+    ok(&mut db, "INSERT INTO deep VALUES (1)");
+    let sum = format!("SELECT 1{} FROM deep", " + x".repeat(links));
+    assert_eq!(q(&mut db, &sum), [(links + 1).to_string()]);
+    let ors = " OR x = 0".repeat(links - 1);
+    let filter = format!("SELECT x FROM deep WHERE x = 0{ors} OR x = 1");
+    assert_eq!(q(&mut db, &filter), ["1"]);
+}
+
+#[test]
+fn accepted_expression_chains_fit_in_a_default_thread_stack() {
+    // Estouro de pilha derruba o processo: cada tamanho roda num subprocesso, na
+    // thread de 2 MiB que o libtest dá a cada teste. 999 é o maior que o parser aceita.
+    let run = |links: usize| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "deep_expression_child"])
+            .env("MINIDB_DEEP_LINKS", links.to_string())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    let fits = [125, 250, 500, 999].map(|n| (n, run(n)));
+    assert!(fits.iter().all(|&(_, ok)| ok), "{fits:?}");
+}
