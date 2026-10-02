@@ -1396,7 +1396,10 @@ impl Conn<'_> {
             }
             CopyTarget::Query(q) => {
                 let word: String = q.chars().take_while(char::is_ascii_alphabetic).collect();
-                if !matches!(word.to_ascii_lowercase().as_str(), "select" | "with" | "values") {
+                if !matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "select" | "with" | "values"
+                ) {
                     return Err(bad("(consulta) deve ser SELECT, WITH ou VALUES"));
                 }
                 q.clone()
