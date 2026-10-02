@@ -67,6 +67,8 @@ fn rename_without_dependents_works() {
 #[test]
 fn rename_migrates_grants() {
     let mut db = open();
+    // O primeiro usuário precisa ser superusuário.
+    ok(&mut db, "CREATE USER root PASSWORD 'r' SUPERUSER");
     ok(&mut db, "CREATE USER ana PASSWORD 'x'");
     ok(&mut db, "GRANT SELECT, INSERT ON jogo TO ana");
     ok(&mut db, "ALTER TABLE jogo RENAME TO jogo2");
