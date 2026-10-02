@@ -30,7 +30,8 @@ Segurança
   cliente não consegue mais recalculá-lo para descobrir quem existe.
 - Parser: uma expressão aceita até 1 000 operadores encadeados (`1 + 1 + ...`,
   `a OR b OR ...`) e um comando até 500 `UNION`/`INTERSECT`/`EXCEPT`; acima disso é
-  erro, em vez de montar uma árvore que estoura a pilha do executor.
+  erro. O executor avalia essas cadeias em laço: 999 operadores cabem numa pilha de
+  2 MiB em build de depuração (medido no CI); antes, 250 já a estouravam.
 - Regex: orçamento total de passos por varredura, além do limite por posição inicial.
 - `encrypt`/`decrypt`/`rekey` seguram o lock do diretório do início ao fim e recusam
   um banco aberto.
