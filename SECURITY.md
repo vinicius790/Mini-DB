@@ -63,8 +63,11 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
 - **Criptografia em repouso** (1.0): com `passphrase` (`MINIDB_PASSPHRASE`) o banco novo
   cifra páginas (`data.mdb`, journal, spill) e frames do WAL/arquivo com ChaCha20; a
   chave vem de PBKDF2-HMAC-SHA256 (20 000 iterações) da senha e `data.mdb.key` guarda só
-  sal e verificador. Cabeçalhos de página (32 bytes: id, tipo, contadores) e o tipo de
-  cada registro do WAL ficam em claro. Senha errada é recusada na abertura. Não há
+  sal e verificador. Bancos criados a partir desta versão (`data.mdb.key` versão 2)
+  autenticam cada página com Poly1305 (adulteração ou troca de páginas dão `CorruptPage`);
+  bancos antigos seguem no formato anterior até um `encrypt`/`rekey`. O tipo de cada
+  registro do WAL fica em claro e o WAL cifrado não tem etiqueta. Replay de uma versão
+  antiga da mesma página não é detectado. Senha errada é recusada na abertura. Não há
   autenticação criptográfica das páginas (o checksum detecta corrupção acidental) e um
   `minidb encrypt|decrypt|rekey [dir]` (senhas em `MINIDB_PASSPHRASE` /
   `MINIDB_NEW_PASSPHRASE`) converte um banco fechado no lugar, reescrevendo as páginas
