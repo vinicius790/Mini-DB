@@ -115,6 +115,16 @@ impl Timing {
     }
 }
 
+/// splitmix64: sementes vizinhas não podem dar a mesma sequência de sorteios (dois
+/// nós em sincronia empatariam todas as eleições). Nunca devolve zero, que travaria
+/// o xorshift.
+fn mix(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)).max(1)
+}
+
 /// Máquina de estados da eleição de um nó.
 pub struct Node {
     id: NodeId,
@@ -147,7 +157,7 @@ impl Node {
             state: State::Follower,
             leader: None,
             timing,
-            rng: timing.seed | 1,
+            rng: mix(timing.seed),
             deadline: now,
             votes: BTreeSet::new(),
             contact: BTreeMap::new(),
