@@ -51,6 +51,7 @@ pub mod mvcc;
 pub mod page;
 pub mod pg;
 pub mod pubkey;
+pub mod raft;
 pub mod rel;
 pub mod replica;
 pub mod replication;

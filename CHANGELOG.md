@@ -2,6 +2,18 @@
 
 ## Não lançado (correções pós-1.3.0)
 
+Replicação
+- Modo cluster opcional com failover automático: eleição de líder no estilo Raft
+  (`src/raft.rs`, máquina de estados pura e determinística) sobre a replicação lógica
+  existente. Liga com `cluster_id` + `cluster_peers` (+ `election_timeout_ms`) em
+  `minidb.toml`/`MINIDB_CLUSTER_*`; exige `repl_secret`. O vencedor do termo `T` é
+  promovido com época `T` (o fencing existente recusa o líder antigo), os seguidores
+  trocam de upstream em execução e cada commit do líder espera a maioria. Termo e voto
+  ficam em `raft-state` (temporário + fsync + rename). `PROMOTE` manual é recusado
+  nesse modo. Sem `cluster_peers` nada muda. Limites e garantias em
+  `docs/REPLICA.md` (sem mudança de membros, sem leitura linearizável, janela de
+  deposição documentada).
+
 TLS
 - TLS 1.3 passa a suportar também `TLS_AES_128_GCM_SHA256` (0x1301, a suíte obrigatória do
   RFC 8446 e a primeira que clientes comuns oferecem), além de `TLS_CHACHA20_POLY1305_SHA256`;

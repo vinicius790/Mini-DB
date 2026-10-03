@@ -5,7 +5,8 @@
 //! `MINIDB_TOKEN`, `MINIDB_MAX_CONNECTIONS`, `MINIDB_MAX_BODY`,
 //! `MINIDB_REPL_SECRET`, `MINIDB_SYNC_REPLICAS`, `MINIDB_SYNC_TIMEOUT_MS`,
 //! `MINIDB_WAL_RETENTION_MB`, `MINIDB_AUTO_CHECKPOINT_MB`,
-//! `MINIDB_MAINTENANCE_SECS`.
+//! `MINIDB_MAINTENANCE_SECS`, `MINIDB_CLUSTER_ID`, `MINIDB_CLUSTER_PEERS`,
+//! `MINIDB_ELECTION_TIMEOUT_MS`.
 
 use crate::error::{Error, Result};
 use std::env;
@@ -52,6 +53,13 @@ pub struct Config {
     pub auto_checkpoint_mb: u64,
     /// Intervalo da manutenção automática (purge/vacuum/checkpoint; 0 = desliga).
     pub maintenance_secs: u64,
+    /// Modo cluster (eleição automática): identificador deste nó, maior que 0.
+    pub cluster_id: u64,
+    /// Outros nós do cluster, `id@endereço` separados por vírgula; vazio desliga
+    /// o modo cluster (ver `docs/REPLICA.md`).
+    pub cluster_peers: String,
+    /// Base do timeout de eleição em ms (cada nó sorteia entre ela e o dobro).
+    pub election_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -80,6 +88,9 @@ impl Default for Config {
             wal_retention_mb: 256,
             auto_checkpoint_mb: 64,
             maintenance_secs: 60,
+            cluster_id: 0,
+            cluster_peers: String::new(),
+            election_timeout_ms: 1500,
         }
     }
 }
@@ -224,6 +235,9 @@ impl Config {
             ("MINIDB_WAL_RETENTION_MB", "wal_retention_mb"),
             ("MINIDB_AUTO_CHECKPOINT_MB", "auto_checkpoint_mb"),
             ("MINIDB_MAINTENANCE_SECS", "maintenance_secs"),
+            ("MINIDB_CLUSTER_ID", "cluster_id"),
+            ("MINIDB_CLUSTER_PEERS", "cluster_peers"),
+            ("MINIDB_ELECTION_TIMEOUT_MS", "election_timeout_ms"),
         ] {
             if let Ok(v) = env::var(var) {
                 set(&mut cfg, key, &v);
@@ -291,6 +305,9 @@ fn set(cfg: &mut Config, key: &str, v: &str) {
         "wal_retention_mb" => num(v, &mut cfg.wal_retention_mb),
         "auto_checkpoint_mb" => num(v, &mut cfg.auto_checkpoint_mb),
         "maintenance_secs" => num(v, &mut cfg.maintenance_secs),
+        "cluster_id" => num(v, &mut cfg.cluster_id),
+        "cluster_peers" => cfg.cluster_peers = v.to_string(),
+        "election_timeout_ms" => num(v, &mut cfg.election_timeout_ms),
         _ => {}
     }
 }
@@ -307,5 +324,18 @@ mod tests {
         assert_eq!(cfg.tls_client_auth.as_deref(), Some("required"));
         assert!(cfg.tls, "valor desconhecido mantém o padrão");
         assert!(!cfg.fsync);
+    }
+
+    #[test]
+    fn cluster_settings_are_off_by_default_and_parse_from_the_file() {
+        let mut cfg = Config::default();
+        assert!(cfg.cluster_peers.is_empty(), "modo cluster desligado");
+        parse_into("cluster_id = 2\nelection_timeout_ms = 900\n", &mut cfg);
+        parse_into("cluster_peers = \"1@a:7001,3@c:7001\"\n", &mut cfg);
+        assert_eq!(cfg.cluster_id, 2);
+        assert_eq!(cfg.cluster_peers, "1@a:7001,3@c:7001");
+        assert_eq!(cfg.election_timeout_ms, 900);
+        let peers = crate::raft::parse_peers(&cfg.cluster_peers).unwrap();
+        assert_eq!(peers.len(), 2);
     }
 }

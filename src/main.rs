@@ -14,7 +14,7 @@ use mini_db::config::Config;
 use mini_db::http;
 use mini_db::metrics::Metrics;
 use mini_db::mvcc::SharedDb;
-use mini_db::replication::{self, ReplicationConfig};
+use mini_db::replication::{self, ClusterConfig, ReplicationConfig};
 use mini_db::Db;
 
 fn usage() -> ! {
@@ -75,7 +75,10 @@ fn start_background(
         }
     }
     let rcfg = repl_config(cfg);
-    if let Some(addr) = primary {
+    let peers = mini_db::raft::parse_peers(&cfg.cluster_peers)?;
+    if !peers.is_empty() {
+        start_cluster(db, cfg, peers, primary, replica_of.is_some())?;
+    } else if let Some(addr) = primary {
         let timeout =
             (cfg.sync_timeout_ms > 0).then_some(Duration::from_millis(cfg.sync_timeout_ms));
         replication::enable_feed(db, rcfg.max_feed_ops)?;
@@ -113,6 +116,36 @@ fn start_background(
             }
         });
     }
+    Ok(())
+}
+
+/// Modo cluster: `--primary ADDR` é o endereço deste nó para réplicas e pares.
+fn start_cluster(
+    db: &SharedDb,
+    cfg: &Config,
+    peers: Vec<(u64, String)>,
+    listen: Option<String>,
+    replica_of: bool,
+) -> mini_db::Result<()> {
+    if replica_of {
+        return Err(mini_db::Error::Cli(
+            "modo cluster não combina com --replica-of: o líder é eleito".into(),
+        ));
+    }
+    let Some(listen) = listen else {
+        return Err(mini_db::Error::Cli(
+            "modo cluster exige --primary ADDR (o endereço de replicação deste nó)".into(),
+        ));
+    };
+    if cfg.sync_replicas > 0 || cfg.sync_timeout_ms > 0 {
+        eprintln!("minidb cluster: sync_replicas/sync_timeout_ms ignorados; vale a maioria");
+    }
+    let cluster = ClusterConfig {
+        id: cfg.cluster_id,
+        peers,
+        election_timeout: Duration::from_millis(cfg.election_timeout_ms.max(50)),
+    };
+    replication::start_cluster(db, &listen, repl_config(cfg), cluster)?;
     Ok(())
 }
 

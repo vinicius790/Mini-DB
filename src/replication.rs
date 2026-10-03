@@ -30,23 +30,32 @@
 //! uma réplica de época maior se isola (fica somente leitura); uma réplica
 //! nunca segue um primário de época menor.
 //!
+//! **Cluster (opcional).** Com [`start_cluster`], os nós elegem o líder
+//! sozinhos ([`crate::raft`], estilo Raft): o vencedor do termo `T` é promovido
+//! com época `T` e cada commit dele espera a maioria. Sem pares configurados,
+//! nada disso roda e o comportamento é o descrito acima.
+//!
 //! Protocolo: o primário envia `MINIDB-REPL 2 <época> <nonce> <auth>`; a réplica
 //! responde `SYNC <lsn> <época> <nonce> <snapshot?> <mac|->`; o primário diz
 //! `OK` ou `ERR <motivo>`. Depois, quadros `[len:u32][corpo]`, com corpo
 //! `[tipo:u8][lsn:u64][ops]` (cifrado + tag de 16 bytes quando autenticado).
 //! Op: `[1][klen:u16][key][vlen:u32][val]` (put), `[2][klen][key]` (delete),
-//! `[3][klen][key][at:u64]` (expiração absoluta em ms).
+//! `[3][klen][key][at:u64]` (expiração absoluta em ms). Um par do cluster
+//! responde `RAFT <nonce> <mac>` em vez de `SYNC`; os quadros seguintes levam
+//! mensagens da eleição ([`crate::raft::Message`]), sempre cifradas.
 
 use crate::crypto;
 use crate::db::{Db, Op, RESERVED_PREFIX};
 use crate::error::{Error, Result};
 use crate::mvcc::SharedDb;
+use crate::raft::{self, Action, LogPos, Message, Node, NodeId};
 use crate::wal::Wal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -151,6 +160,8 @@ struct HubState {
     snapshots_sent: u64,
     stop_replica: Option<Arc<AtomicBool>>,
     upstream: Option<String>,
+    /// Modo cluster: canal para o laço da eleição (pedidos de pares).
+    raft: Option<mpsc::Sender<Event>>,
 }
 
 /// Estado de replicação de um banco (feed, confirmações, papel).
@@ -160,6 +171,14 @@ pub struct Hub {
     cv: Condvar,
     resyncing: AtomicBool,
     fenced: AtomicBool,
+    /// Modo cluster ligado: promoção manual recusada e `SYNC` só no líder.
+    cluster: AtomicBool,
+    /// Modo cluster: este nó é o líder promovido do termo atual.
+    leading: AtomicBool,
+    /// Líder deposto: libera os commits que esperavam confirmações.
+    deposed: AtomicBool,
+    /// Serializa cada quadro aplicado do upstream com a parada da réplica.
+    gate: Mutex<()>,
 }
 
 impl Hub {
@@ -183,6 +202,12 @@ impl Hub {
         }
         let deadline = state.sync_timeout.map(|t| Instant::now() + t);
         loop {
+            if self.deposed.load(Ordering::Acquire) {
+                // Líder deposto (cluster): ninguém mais confirma; o commit segue
+                // sem a maioria e conta como timeout (ver docs/REPLICA.md).
+                state.sync_timeouts += 1;
+                return;
+            }
             let confirmed = state.acks.values().filter(|&&a| a >= lsn).count();
             if confirmed >= state.sync_replicas {
                 return;
@@ -335,6 +360,11 @@ pub fn status(shared: &SharedDb) -> Result<ReplicationStatus> {
 /// Promove esta réplica a primário: para de seguir o upstream, incrementa a
 /// época e passa a aceitar escritas. Devolve a nova época.
 pub fn promote(shared: &SharedDb) -> Result<u64> {
+    if hub_of(shared)?.cluster.load(Ordering::Acquire) {
+        return Err(Error::Unavailable(
+            "modo cluster ativo: a promoção é automática, por eleição".into(),
+        ));
+    }
     let mut db = shared.write()?;
     if db.repl.resyncing() {
         return Err(Error::Unavailable(
@@ -353,6 +383,63 @@ pub fn promote(shared: &SharedDb) -> Result<u64> {
     db.set_read_only(false);
     db.repl.fenced.store(false, Ordering::Release);
     Ok(next)
+}
+
+/// Promoção do líder eleito: como [`promote`], mas com época = `term` (maior que
+/// a atual), `APPLIED_KEY` zerado (marca os dados como originados neste nó; ver
+/// `log_position`) e `sync` confirmações por commit, tudo sob o mesmo lock para
+/// nenhuma escrita entrar antes da exigência de maioria.
+fn promote_cluster(shared: &SharedDb, term: u64, sync: usize) -> Result<()> {
+    let mut db = shared.write()?;
+    if db.repl.resyncing() || db.get_raw(RESYNC_KEY)?.is_some() {
+        return Err(Error::Unavailable(
+            "nó no meio de uma ressincronização não pode liderar".into(),
+        ));
+    }
+    let current = epoch(&db)?;
+    if term <= current {
+        return Err(Error::Other(format!(
+            "termo {term} não é maior que a época {current}"
+        )));
+    }
+    {
+        let mut state = db.repl.lock();
+        if let Some(stop) = state.stop_replica.take() {
+            stop.store(true, Ordering::Release);
+        }
+        state.upstream = None;
+    }
+    let ops = vec![put_u64(EPOCH_KEY, term), put_u64(APPLIED_KEY, 0)];
+    db.write_internal(ops)?;
+    {
+        let mut state = db.repl.lock();
+        state.sync_replicas = sync;
+        state.sync_timeout = None;
+    }
+    db.set_read_only(false);
+    db.repl.fenced.store(false, Ordering::Release);
+    db.repl.deposed.store(false, Ordering::Release);
+    Ok(())
+}
+
+/// Posição do log deste nó para a eleição: `(época, LSN)`. O LSN é o do upstream
+/// aplicado (`APPLIED_KEY`) ou, se os dados são deste nó (líder da época, ou
+/// nunca sincronizou), o último LSN local. `None` durante uma ressincronização:
+/// o estado local foi apagado em parte, então o nó não vota nem se candidata.
+fn log_position(shared: &SharedDb) -> Result<Option<LogPos>> {
+    let db = shared.read_unchecked()?;
+    if db.repl.resyncing() || db.get_raw(RESYNC_KEY)?.is_some() {
+        return Ok(None);
+    }
+    let lsn = match applied_lsn(&db)? {
+        0 => db.last_lsn(),
+        upstream => upstream,
+    };
+    let pos = LogPos {
+        epoch: epoch(&db)?,
+        lsn,
+    };
+    Ok(Some(pos))
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +474,14 @@ struct Half {
 }
 
 impl Half {
+    fn new(keys: Option<Keys>, dir: u8) -> Self {
+        Self {
+            keys,
+            dir,
+            counter: 0,
+        }
+    }
+
     fn seal(&mut self, body: &mut Vec<u8>) {
         if let Some(keys) = &self.keys {
             crypto::chacha20_xor(&keys.enc, &nonce(self.dir, self.counter), 0, body);
@@ -507,7 +602,11 @@ fn decode_body(body: &[u8]) -> Result<(u8, u64, Vec<Op>)> {
 }
 
 fn write_frame(w: &mut impl Write, half: &mut Half, kind: u8, lsn: u64, ops: &[Op]) -> Result<()> {
-    let mut body = encode_body(kind, lsn, ops);
+    write_sealed(w, half, encode_body(kind, lsn, ops))
+}
+
+/// Envia um corpo qualquer como quadro `[len:u32][corpo selado]`.
+fn write_sealed(w: &mut impl Write, half: &mut Half, mut body: Vec<u8>) -> Result<()> {
     half.seal(&mut body);
     let mut frame = (body.len() as u32).to_le_bytes().to_vec();
     frame.extend(body);
@@ -517,6 +616,11 @@ fn write_frame(w: &mut impl Write, half: &mut Half, kind: u8, lsn: u64, ops: &[O
 }
 
 fn read_frame(r: &mut impl Read, half: &mut Half) -> Result<(u8, u64, Vec<Op>)> {
+    decode_body(&read_sealed(r, half)?)
+}
+
+/// Lê um quadro e devolve o corpo aberto (autenticado e decifrado).
+fn read_sealed(r: &mut impl Read, half: &mut Half) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as u64;
@@ -532,7 +636,7 @@ fn read_frame(r: &mut impl Read, half: &mut Half) -> Result<(u8, u64, Vec<Op>)> 
             "conexão encerrada no meio de um quadro".into(),
         ));
     }
-    decode_body(&half.open(body)?)
+    half.open(body)
 }
 
 fn read_line(r: &mut impl BufRead) -> Result<String> {
@@ -586,6 +690,12 @@ pub fn serve_primary_with(shared: SharedDb, addr: &str, cfg: ReplicationConfig) 
             "texto claro"
         }
     );
+    accept_loop(shared, listener, cfg);
+    Ok(())
+}
+
+/// Atende réplicas (e, no modo cluster, pares) que chegam em `listener`.
+fn accept_loop(shared: SharedDb, listener: TcpListener, cfg: ReplicationConfig) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let (shared, cfg) = (shared.clone(), cfg.clone());
@@ -599,7 +709,6 @@ pub fn serve_primary_with(shared: SharedDb, addr: &str, cfg: ReplicationConfig) 
             }
         });
     }
-    Ok(())
 }
 
 fn hub_of(shared: &SharedDb) -> Result<Arc<Hub>> {
@@ -621,6 +730,9 @@ fn serve_replica(shared: &SharedDb, stream: TcpStream, cfg: &ReplicationConfig) 
         u8::from(cfg.secret.is_some())
     )?;
     let line = read_line(&mut reader)?;
+    if line.starts_with("RAFT ") {
+        return serve_raft(&hub, reader, out, &np, &line, cfg);
+    }
     let parts: Vec<&str> = line.split(' ').collect();
     let (after, their_epoch, nr, want_snapshot, mac) = match parts.as_slice() {
         ["SYNC", after, ep, nr, snap, mac] => (
@@ -647,6 +759,10 @@ fn serve_replica(shared: &SharedDb, stream: TcpStream, cfg: &ReplicationConfig) 
         }
         None => None,
     };
+    if hub.cluster.load(Ordering::Acquire) && !hub.leading.load(Ordering::Acquire) {
+        writeln!(out, "ERR este nó não é o líder do cluster")?;
+        return Err(Error::Other("SYNC recusado: não é o líder".into()));
+    }
     if their_epoch > my_epoch {
         // Alguém foi promovido depois de nós: este primário está obsoleto.
         hub.fenced.store(true, Ordering::Release);
@@ -1008,6 +1124,12 @@ fn follow(
     let hub = hub_of(shared)?;
     while !stop.load(Ordering::Acquire) {
         let (kind, lsn, ops) = read_frame(&mut reader, &mut recv)?;
+        // Quem para a réplica (promoção, troca de líder no cluster) espera este
+        // quadro terminar; depois da parada nada mais é aplicado nem confirmado.
+        let _gate = hub.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match kind {
             T_BATCH => {
                 let mut ops = transferable(&ops);
@@ -1015,7 +1137,7 @@ fn follow(
                 apply(shared, ops)?;
                 after = lsn;
             }
-            T_SNAP_BEGIN => begin_resync(shared, &hub)?,
+            T_SNAP_BEGIN => begin_resync(shared, &hub, stop)?,
             T_SNAP_CHUNK => apply(shared, transferable(&ops))?,
             T_SNAP_END => {
                 apply(
@@ -1033,7 +1155,7 @@ fn follow(
             T_HEARTBEAT => {}
             other => return Err(Error::Other(format!("tipo de quadro desconhecido {other}"))),
         }
-        if matches!(kind, T_BATCH | T_SNAP_END | T_HEARTBEAT) {
+        if matches!(kind, T_BATCH | T_SNAP_END | T_HEARTBEAT) && !stop.load(Ordering::Acquire) {
             write_frame(&mut out, &mut send, T_ACK, after, &[])?;
         }
     }
@@ -1041,13 +1163,17 @@ fn follow(
 }
 
 /// Marca a ressincronização (persistida) e apaga o estado antigo em lotes.
-fn begin_resync(shared: &SharedDb, hub: &Hub) -> Result<()> {
+fn begin_resync(shared: &SharedDb, hub: &Hub, stop: &AtomicBool) -> Result<()> {
     hub.resyncing.store(true, Ordering::Release);
     apply(
         shared,
         vec![put_u64(RESYNC_KEY, 1), put_u64(APPLIED_KEY, 0)],
     )?;
     loop {
+        if stop.load(Ordering::Acquire) {
+            // A marca fica: a próxima sessão recomeça do snapshot.
+            return Err(Error::Other("ressincronização interrompida".into()));
+        }
         let keys: Vec<Vec<u8>> = {
             let db = shared.read_unchecked()?;
             db.iter_raw(&[0], None)?
@@ -1068,6 +1194,536 @@ fn begin_resync(shared: &SharedDb, hub: &Hub) -> Result<()> {
             shared,
             keys.into_iter().map(|key| Op::Delete { key }).collect(),
         )?;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster: eleição automática (estilo Raft) sobre a replicação
+// ---------------------------------------------------------------------------
+
+/// Configuração do modo cluster.
+#[derive(Clone, Debug)]
+pub struct ClusterConfig {
+    /// Identificador deste nó (`cluster_id`, maior que 0).
+    pub id: NodeId,
+    /// Os outros nós: `(id, endereço de replicação)`.
+    pub peers: Vec<(NodeId, String)>,
+    /// Base do timeout de eleição: cada nó sorteia entre `base` e `2 * base` a
+    /// cada eleição; o líder manda batimentos a cada `base / 5`.
+    pub election_timeout: Duration,
+}
+
+/// Nó do cluster em execução (devolvido por [`start_cluster`]).
+pub struct ClusterHandle {
+    stop: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl ClusterHandle {
+    /// Tira este nó do cluster: deixa de votar, de mandar batimentos e de seguir
+    /// o líder, e fica somente leitura. O banco continua aberto e o endereço de
+    /// replicação continua escutando, mas recusa pares e réplicas.
+    pub fn shutdown(self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.handle.join();
+    }
+}
+
+/// Evento para o laço da eleição.
+enum Event {
+    /// Pedido de um par e o canal da resposta.
+    Rpc(Message, mpsc::Sender<Message>),
+    /// Resposta de um par a um pedido deste nó.
+    Reply(Message),
+}
+
+/// Liga o modo cluster: escuta réplicas e pares em `listen` (o endereço de
+/// replicação deste nó), começa como seguidor somente leitura e elege um líder
+/// com os pares de `cluster` ([`crate::raft`]). O vencedor do termo `T` é
+/// promovido com época `T`; os outros passam a segui-lo. Cada commit do líder
+/// espera a maioria (`sync_replicas` = nós / 2, sem timeout). Exige o segredo
+/// de replicação: votos e batimentos usam o canal autenticado e cifrado.
+pub fn start_cluster(
+    shared: &SharedDb,
+    listen: &str,
+    cfg: ReplicationConfig,
+    cluster: ClusterConfig,
+) -> Result<ClusterHandle> {
+    let Some(secret) = cfg.secret.clone() else {
+        return Err(Error::Other(
+            "modo cluster exige o segredo de replicação (MINIDB_REPL_SECRET)".into(),
+        ));
+    };
+    let mut ids: Vec<NodeId> = cluster.peers.iter().map(|(id, _)| *id).collect();
+    ids.push(cluster.id);
+    ids.sort_unstable();
+    ids.dedup();
+    if cluster.peers.is_empty() || ids[0] == 0 || ids.len() != cluster.peers.len() + 1 {
+        return Err(Error::Other(
+            "modo cluster: ids de nó (cluster_id e pares) distintos e maiores que 0".into(),
+        ));
+    }
+    let dir = shared.read_unchecked()?.dir().to_path_buf();
+    let mut hard = raft::load_hard_state(&dir)?;
+    let current = epoch(&*shared.read_unchecked()?)?;
+    if hard.term < current {
+        // O termo nunca fica atrás da época já gravada nos dados.
+        hard = raft::HardState {
+            term: current,
+            voted_for: None,
+        };
+    }
+    let listener = TcpListener::bind(listen)?;
+    enable_feed(shared, cfg.max_feed_ops)?;
+    set_sync_replicas(shared, 0, None)?;
+    shared.write()?.set_read_only(true);
+    let hub = hub_of(shared)?;
+    hub.cluster.store(true, Ordering::Release);
+    hub.fenced.store(true, Ordering::Release);
+    let (events_tx, events) = mpsc::channel();
+    hub.lock().raft = Some(events_tx.clone());
+    let idle = TargetState {
+        addr: None,
+        stop: Arc::new(AtomicBool::new(true)),
+        closed: false,
+    };
+    let target = Arc::new(Target {
+        state: Mutex::new(idle),
+        cv: Condvar::new(),
+    });
+    {
+        let (shared, cfg) = (shared.clone(), cfg.clone());
+        thread::spawn(move || accept_loop(shared, listener, cfg));
+    }
+    {
+        let (shared, hub, target) = (shared.clone(), Arc::clone(&hub), Arc::clone(&target));
+        thread::spawn(move || cluster_follow(shared, hub, target, cfg));
+    }
+    let timeout = cluster.election_timeout;
+    let mut links = BTreeMap::new();
+    for (id, addr) in &cluster.peers {
+        let (tx, rx) = mpsc::channel();
+        let (addr, secret, events) = (addr.clone(), secret.clone(), events_tx.clone());
+        thread::spawn(move || peer_link(&addr, &secret, rx, events, timeout));
+        links.insert(*id, tx);
+    }
+    drop(events_tx);
+    let seed = u64::from_le_bytes(crypto::random_bytes());
+    let timing = raft::Timing::new(timeout, seed);
+    let peers = cluster.peers.iter().map(|(id, _)| *id).collect();
+    let node = Node::new(cluster.id, peers, hard, timing, Instant::now());
+    let nodes = cluster.peers.len() + 1;
+    let driver = Driver {
+        shared: shared.clone(),
+        hub,
+        target,
+        dir,
+        id: cluster.id,
+        addrs: cluster.peers.into_iter().collect(),
+        links,
+        sync: nodes / 2,
+        saved: hard,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let tick = (timing.heartbeat() / 2).max(Duration::from_millis(5));
+    let handle = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || driver.run(node, events, &stop, tick))
+    };
+    Ok(ClusterHandle { stop, handle })
+}
+
+/// Upstream que a réplica do cluster segue, trocável em execução.
+struct Target {
+    state: Mutex<TargetState>,
+    cv: Condvar,
+}
+
+struct TargetState {
+    addr: Option<String>,
+    /// Parada da sessão atual (cada troca de upstream cria outra).
+    stop: Arc<AtomicBool>,
+    closed: bool,
+}
+
+impl Target {
+    fn lock(&self) -> MutexGuard<'_, TargetState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Troca o upstream (`None` = não seguir ninguém). Ao voltar, a sessão
+    /// anterior não aplica nem confirma mais nada: um nó que viu um termo maior
+    /// não confirma mais escritas do líder antigo (regra do Raft).
+    fn set(&self, hub: &Hub, addr: Option<String>) {
+        let mut state = self.lock();
+        if state.addr == addr {
+            return;
+        }
+        state.stop.store(true, Ordering::Release);
+        state.stop = Arc::new(AtomicBool::new(false));
+        state.addr = addr;
+        drop(state);
+        self.cv.notify_all();
+        // Espera o quadro em andamento, se houver, terminar.
+        drop(hub.gate.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    fn close(&self, hub: &Hub) {
+        self.set(hub, None);
+        self.lock().closed = true;
+        self.cv.notify_all();
+    }
+
+    /// Bloqueia até haver upstream; `None` = encerrado.
+    fn next(&self) -> Option<(String, Arc<AtomicBool>)> {
+        let mut state = self.lock();
+        loop {
+            if state.closed {
+                return None;
+            }
+            let live = !state.stop.load(Ordering::Acquire);
+            if let (Some(addr), true) = (&state.addr, live) {
+                return Some((addr.clone(), Arc::clone(&state.stop)));
+            }
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Réplica do cluster: segue o upstream escolhido pela eleição até o fim.
+fn cluster_follow(shared: SharedDb, hub: Arc<Hub>, target: Arc<Target>, cfg: ReplicationConfig) {
+    while let Some((addr, stop)) = target.next() {
+        if let Err(e) = start_following(&shared, &addr, &stop) {
+            eprintln!("minidb cluster: não consegui seguir {addr}: {e}");
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        while !stop.load(Ordering::Acquire) {
+            if let Err(e) = follow(&shared, &addr, &stop, &cfg) {
+                if !stop.load(Ordering::Acquire) {
+                    eprintln!("minidb cluster: upstream {addr}: {e}");
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+        // `fenced` antes de largar o upstream: ROLE nunca mostra "primary" aqui.
+        if !hub.leading.load(Ordering::Acquire) {
+            hub.fenced.store(true, Ordering::Release);
+        }
+        let mut state = hub.lock();
+        if state.upstream.as_deref() == Some(addr.as_str()) {
+            state.upstream = None;
+        }
+    }
+}
+
+/// O preparo de [`run_replica_with`], para uma sessão do cluster.
+fn start_following(shared: &SharedDb, addr: &str, stop: &Arc<AtomicBool>) -> Result<()> {
+    let mut db = shared.write()?;
+    db.set_read_only(true);
+    let resync = db.get_raw(RESYNC_KEY)?.is_some();
+    db.repl.resyncing.store(resync, Ordering::Release);
+    db.repl.fenced.store(false, Ordering::Release);
+    let mut state = db.repl.lock();
+    state.stop_replica = Some(Arc::clone(stop));
+    state.upstream = Some(addr.to_string());
+    Ok(())
+}
+
+fn raft_mac(secret: &[u8], np: &[u8], nr: &[u8]) -> String {
+    let mac = crypto::hmac_sha256(secret, &[b"minidb-repl-raft", np, nr]);
+    crypto::to_hex(&mac)
+}
+
+/// Conexão autenticada com um par, para pedidos da eleição.
+struct RaftConn {
+    out: TcpStream,
+    reader: BufReader<TcpStream>,
+    send: Half,
+    recv: Half,
+}
+
+impl RaftConn {
+    fn connect(addr: &str, secret: &[u8], timeout: Duration) -> Result<Self> {
+        let resolved = addr.to_socket_addrs()?.next();
+        let Some(sock) = resolved else {
+            return Err(Error::Other(format!("endereço inválido: {addr}")));
+        };
+        let stream = TcpStream::connect_timeout(&sock, timeout)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(timeout))?;
+        let mut out = stream.try_clone()?;
+        let mut reader = BufReader::new(stream);
+        let hello = read_line(&mut reader)?;
+        let parts: Vec<&str> = hello.split(' ').collect();
+        let np = match parts.as_slice() {
+            ["MINIDB-REPL", _, _, np, "1"] => crypto::from_hex(np),
+            _ => None,
+        };
+        let Some(np) = np else {
+            return Err(Error::Other(format!(
+                "par sem canal de replicação autenticado: {hello:?}"
+            )));
+        };
+        let nr: [u8; 16] = crypto::random_bytes();
+        let (nr_hex, mac) = (crypto::to_hex(&nr), raft_mac(secret, &np, &nr));
+        writeln!(out, "RAFT {nr_hex} {mac}")?;
+        let answer = read_line(&mut reader)?;
+        if answer != "OK" {
+            return Err(Error::Other(format!("par recusou: {answer}")));
+        }
+        let keys = derive_keys(secret, &np, &nr);
+        Ok(Self {
+            out,
+            reader,
+            send: Half::new(Some(keys.clone()), 1),
+            recv: Half::new(Some(keys), 0),
+        })
+    }
+
+    fn call(&mut self, msg: Message) -> Result<Message> {
+        write_sealed(&mut self.out, &mut self.send, msg.encode())?;
+        let body = read_sealed(&mut self.reader, &mut self.recv)?;
+        match Message::decode(&body) {
+            Some(reply) => Ok(reply),
+            None => Err(Error::Other("resposta de eleição malformada".into())),
+        }
+    }
+}
+
+/// Envia os pedidos deste nó a um par, um por vez, e entrega as respostas ao
+/// laço da eleição. Mensagens acumuladas são descartadas: só a mais nova importa.
+fn peer_link(
+    addr: &str,
+    secret: &[u8],
+    outbox: mpsc::Receiver<Message>,
+    events: mpsc::Sender<Event>,
+    timeout: Duration,
+) {
+    let mut conn: Option<RaftConn> = None;
+    while let Ok(mut msg) = outbox.recv() {
+        while let Ok(newer) = outbox.try_recv() {
+            msg = newer;
+        }
+        if conn.is_none() {
+            conn = RaftConn::connect(addr, secret, timeout).ok();
+        }
+        let Some(c) = conn.as_mut() else { continue };
+        match c.call(msg) {
+            Ok(reply) => {
+                if events.send(Event::Reply(reply)).is_err() {
+                    return;
+                }
+            }
+            Err(_) => conn = None,
+        }
+    }
+}
+
+/// Sessão de um par do cluster: pedidos de voto e batimentos, um por vez.
+fn serve_raft(
+    hub: &Hub,
+    mut reader: BufReader<TcpStream>,
+    mut out: TcpStream,
+    np: &[u8],
+    line: &str,
+    cfg: &ReplicationConfig,
+) -> Result<()> {
+    let events = hub.lock().raft.clone();
+    let parts: Vec<&str> = line.split(' ').collect();
+    let (nr, mac) = match parts.as_slice() {
+        ["RAFT", nr, mac] => (crypto::from_hex(nr), *mac),
+        _ => (None, ""),
+    };
+    let (Some(secret), Some(events), Some(nr)) = (&cfg.secret, events, nr) else {
+        writeln!(out, "ERR pedido de eleição recusado")?;
+        return Err(Error::Other("pedido de eleição recusado".into()));
+    };
+    let expected = raft_mac(secret, np, &nr);
+    if !crypto::constant_time_eq(expected.as_bytes(), mac.as_bytes()) {
+        writeln!(out, "ERR autenticação recusada")?;
+        return Err(Error::Other("segredo inválido de par".into()));
+    }
+    writeln!(out, "OK")?;
+    let keys = derive_keys(secret, np, &nr);
+    let mut send = Half::new(Some(keys.clone()), 0);
+    let mut recv = Half::new(Some(keys), 1);
+    let idle = Some(Duration::from_secs(60));
+    reader.get_mut().set_read_timeout(idle)?;
+    loop {
+        let body = read_sealed(&mut reader, &mut recv)?;
+        let msg = match Message::decode(&body) {
+            Some(msg) => msg,
+            None => return Err(Error::Other("pedido de eleição malformado".into())),
+        };
+        let (tx, rx) = mpsc::channel();
+        if events.send(Event::Rpc(msg, tx)).is_err() {
+            return Err(Error::Other("nó fora do cluster".into()));
+        }
+        let reply = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(reply) => reply,
+            Err(_) => return Err(Error::Other("laço da eleição não respondeu".into())),
+        };
+        write_sealed(&mut out, &mut send, reply.encode())?;
+    }
+}
+
+/// Laço da eleição de um nó: camada fina entre [`raft::Node`] e o banco.
+struct Driver {
+    shared: SharedDb,
+    hub: Arc<Hub>,
+    target: Arc<Target>,
+    dir: PathBuf,
+    id: NodeId,
+    addrs: BTreeMap<NodeId, String>,
+    links: BTreeMap<NodeId, mpsc::Sender<Message>>,
+    /// Confirmações que cada commit do líder espera (maioria − 1).
+    sync: usize,
+    /// Último estado gravado em disco.
+    saved: raft::HardState,
+}
+
+impl Driver {
+    fn run(
+        mut self,
+        mut node: Node,
+        events: mpsc::Receiver<Event>,
+        stop: &AtomicBool,
+        tick: Duration,
+    ) {
+        while !stop.load(Ordering::Acquire) {
+            let (msg, asker) = match events.recv_timeout(tick) {
+                Ok(Event::Rpc(msg, reply)) => (Some(msg), Some(reply)),
+                Ok(Event::Reply(msg)) => (Some(msg), None),
+                Err(mpsc::RecvTimeoutError::Timeout) => (None, None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let now = Instant::now();
+            let position = self.position();
+            let mut out = Vec::new();
+            if let Some(msg) = msg {
+                // Antes de adotar um termo maior: nada mais do líder antigo.
+                if msg.term() > node.term() {
+                    self.freeze();
+                }
+                out.extend(node.on_message(now, msg, position));
+            }
+            // Em ressincronização o nó não se candidata; segue seguindo.
+            if node.election_due(now) && position.is_some() {
+                self.freeze();
+            }
+            out.extend(node.on_timeout(now, position));
+            if !self.persist(&node) {
+                // Sem termo e voto no disco, nada sai deste nó.
+                out.retain(|action| matches!(action, Action::StepDown));
+                out.extend(node.resign(now));
+            }
+            for action in out {
+                self.perform(&mut node, action, asker.as_ref());
+            }
+            self.follow_leader(&node);
+        }
+        self.hub.lock().raft = None;
+        self.target.close(&self.hub);
+        self.step_down();
+    }
+
+    /// Para de seguir o upstream e, se liderava, desiste. Vem antes de o nó
+    /// adotar um termo maior ou se candidatar.
+    fn freeze(&self) {
+        self.target.set(&self.hub, None);
+        if self.hub.leading.load(Ordering::Acquire) {
+            self.step_down();
+        }
+    }
+
+    fn step_down(&self) {
+        let hub = &self.hub;
+        hub.leading.store(false, Ordering::Release);
+        hub.deposed.store(true, Ordering::Release);
+        // Sob o lock: um commit entre a checagem e o `wait` não perde o aviso.
+        drop(hub.lock());
+        hub.cv.notify_all();
+        if let Err(e) = self.demote() {
+            eprintln!("minidb cluster: erro ao deixar a liderança: {e}");
+        }
+    }
+
+    fn demote(&self) -> Result<()> {
+        let mut db = self.shared.write()?;
+        db.set_read_only(true);
+        db.repl.lock().sync_replicas = 0;
+        db.repl.fenced.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn become_leader(&self, term: u64) -> Result<()> {
+        self.target.set(&self.hub, None);
+        promote_cluster(&self.shared, term, self.sync)?;
+        self.hub.leading.store(true, Ordering::Release);
+        eprintln!("minidb cluster: nó {} é o líder do termo {term}", self.id);
+        Ok(())
+    }
+
+    fn perform(&self, node: &mut Node, action: Action, asker: Option<&mpsc::Sender<Message>>) {
+        match action {
+            Action::Send { to, msg } => {
+                if let Some(link) = self.links.get(&to) {
+                    let _ = link.send(msg);
+                }
+            }
+            Action::Reply(msg) => {
+                if let Some(asker) = asker {
+                    let _ = asker.send(msg);
+                }
+            }
+            Action::BecomeLeader { term } => {
+                if let Err(e) = self.become_leader(term) {
+                    eprintln!("minidb cluster: promoção no termo {term} falhou: {e}");
+                    let _ = node.resign(Instant::now());
+                    self.step_down();
+                }
+            }
+            Action::StepDown => self.step_down(),
+        }
+    }
+
+    /// Seguidor que conhece o líder do termo passa a segui-lo.
+    fn follow_leader(&self, node: &Node) {
+        if node.state() != raft::State::Follower {
+            return;
+        }
+        if let Some(addr) = node.leader().and_then(|id| self.addrs.get(&id)) {
+            self.target.set(&self.hub, Some(addr.clone()));
+        }
+    }
+
+    fn position(&self) -> Option<LogPos> {
+        match log_position(&self.shared) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("minidb cluster: posição do log indisponível: {e}");
+                None
+            }
+        }
+    }
+
+    /// Grava termo e voto antes de qualquer mensagem sair (regra do Raft).
+    fn persist(&mut self, node: &Node) -> bool {
+        let hard = node.hard_state();
+        if hard == self.saved {
+            return true;
+        }
+        match raft::save_hard_state(&self.dir, hard) {
+            Ok(()) => {
+                self.saved = hard;
+                true
+            }
+            Err(e) => {
+                eprintln!("minidb cluster: não consegui gravar o estado da eleição: {e}");
+                false
+            }
+        }
     }
 }
 
