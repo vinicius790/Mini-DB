@@ -560,11 +560,12 @@ impl Wal {
                 Some(c) if body.len() >= 9 => {
                     let lsn = u64::from_le_bytes(body[0..8].try_into().expect("8"));
                     // `max_lsn` é o LSN do frame anterior no arquivo (0 no primeiro).
-                    c.open_wal(max_lsn, lsn, body[8], &body[9..]).and_then(|plain| {
-                        let mut full = body[..9].to_vec();
-                        full.extend_from_slice(&plain);
-                        WalRecord::decode_body(&full)
-                    })
+                    c.open_wal(max_lsn, lsn, body[8], &body[9..])
+                        .and_then(|plain| {
+                            let mut full = body[..9].to_vec();
+                            full.extend_from_slice(&plain);
+                            WalRecord::decode_body(&full)
+                        })
                 }
                 _ => WalRecord::decode_body(&body),
             };

@@ -491,7 +491,10 @@ mod tests {
         assert_eq!(sealed.len(), 12 + 7 + 16);
         assert_eq!(c.open_wal(41, 42, 1, &sealed).unwrap(), b"payload");
         assert!(c.open_wal(41, 43, 1, &sealed).is_err(), "outro LSN");
-        assert!(c.open_wal(40, 42, 1, &sealed).is_err(), "outro frame anterior");
+        assert!(
+            c.open_wal(40, 42, 1, &sealed).is_err(),
+            "outro frame anterior"
+        );
         assert!(c.open_wal(41, 42, 2, &sealed).is_err(), "outro tipo");
         assert!(c.open_wal(41, 42, 1, &sealed[..20]).is_err(), "curto");
         let other = Cipher::from_passphrase("outra", b"sal", 10);
