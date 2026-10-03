@@ -64,12 +64,16 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
   cifra páginas (`data.mdb`, journal, spill) e frames do WAL/arquivo com ChaCha20; a
   chave vem de PBKDF2-HMAC-SHA256 (20 000 iterações) da senha e `data.mdb.key` guarda só
   sal e verificador. Bancos criados a partir desta versão (`data.mdb.key` versão 2)
-  autenticam cada página com Poly1305 (adulteração ou troca de páginas dão `CorruptPage`);
-  bancos antigos seguem no formato anterior até um `encrypt`/`rekey`. O tipo de cada
-  registro do WAL fica em claro e o WAL cifrado não tem etiqueta. Replay de uma versão
-  antiga da mesma página não é detectado. Senha errada é recusada na abertura. Não há
-  autenticação criptográfica das páginas (o checksum detecta corrupção acidental) e um
-  `minidb encrypt|decrypt|rekey [dir]` (senhas em `MINIDB_PASSPHRASE` /
+  autenticam cada página com Poly1305 (adulteração ou troca de páginas dão `CorruptPage`)
+  e cada frame do WAL com ChaCha20-Poly1305 encadeado pelo LSN do frame anterior (frame
+  alterado, removido, repetido ou fora de ordem dá `CorruptWal`; cortar o fim do WAL,
+  como numa escrita interrompida, continua possível). O tipo e o LSN de cada registro do
+  WAL ficam em claro (autenticados). Bancos antigos (chave v1) seguem no formato
+  anterior, sem etiqueta nas páginas nem no WAL (o checksum só detecta corrupção
+  acidental), até um `encrypt`/`rekey`. Replay de uma versão antiga da mesma página (ou
+  do banco inteiro) não é detectado: exigiria a versão de cada página num lugar
+  autenticado e um contador fora do disco (ver `docs/RECOVERY.md`). Senha errada é
+  recusada na abertura. `minidb encrypt|decrypt|rekey [dir]` (senhas em `MINIDB_PASSPHRASE` /
   `MINIDB_NEW_PASSPHRASE`) converte um banco fechado no lugar, reescrevendo as páginas
   após checkpoint (o WAL arquivado antigo é descartado). Se a conversão for
   interrompida, a abertura seguinte a desfaz (banco e chave originais) ou a conclui.

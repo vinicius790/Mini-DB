@@ -51,8 +51,22 @@ lateral e sem mexer no journal: a etiqueta viaja com a página e a recuperação
 continua uma cópia de bytes. Alterar um byte, mover uma página de lugar ou adulterar o
 cabeçalho dá `CorruptPage` na leitura. Bancos de chave versão 1 mantêm o formato antigo
 (CRC16 em claro, que quem tem o arquivo refaz ou zera) e migram com `encrypt`/`rekey`.
-Não há proteção contra *replay* (devolver uma versão antiga e válida da mesma página) nem
-etiqueta nos frames do WAL cifrado, que contam só com o CRC32 do frame.
+Os frames do WAL desses bancos também são autenticados (ChaCha20-Poly1305 encadeado
+pelo LSN do frame anterior; formato em `docs/WAL.md`): frame alterado, removido,
+repetido ou fora de ordem dá `CorruptWal`, mesmo no fim do arquivo quando o CRC confere.
+Um frame truncado ou com CRC ruim no fim continua sendo tratado como escrita
+interrompida, então quem altera o arquivo pode cortar as últimas transações do WAL, mas
+não mudar as que ficam.
+
+Não há proteção contra *replay* (devolver uma versão antiga e válida da mesma página, ou
+o banco inteiro numa cópia anterior). Fechar isso exigiria guardar a versão atual de
+cada página num lugar autenticado: um contador de geração no AAD obrigaria a regravar
+todas as páginas a cada checkpoint, e uma tabela de etiquetas ou árvore de Merkle muda o
+formato, o journal, o spill, o `VACUUM` e o `convert`. Mesmo assim a volta do diretório
+inteiro a uma cópia anterior coerente só seria detectada com um contador fora do disco.
+O modelo coberto é o de quem lê ou altera os arquivos sem a senha: não lê os dados e não
+forja nem edita páginas ou registros; voltar o banco (ou uma página) a um estado antigo
+que ele mesmo gravou fica fora.
 
 ## VACUUM
 

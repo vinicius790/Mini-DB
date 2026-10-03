@@ -9,8 +9,10 @@ use crate::error::{Error, Result};
 use std::sync::Arc;
 
 pub const WAL_MAGIC: [u8; 4] = *b"MWAL";
-/// Maior corpo de frame aceito na leitura: um valor máximo com chave e cabeçalhos.
-const MAX_FRAME_BODY: u64 = (crate::page::MAX_VALUE_LEN + crate::page::MAX_KEY_LEN + 64) as u64;
+/// Maior corpo de frame aceito na leitura: um valor máximo com chave e cabeçalhos. A
+/// folga cobre a chave interna mais longa (64 bytes além da pública), os campos de
+/// tamanho e o nonce com a etiqueta do frame autenticado (28 bytes).
+const MAX_FRAME_BODY: u64 = (crate::page::MAX_VALUE_LEN + crate::page::MAX_KEY_LEN + 128) as u64;
 pub const WAL_VERSION: u32 = 1;
 
 pub const REC_INSERT: u8 = 1;
@@ -133,13 +135,23 @@ impl WalRecord {
         self.encode_frame_with(None)
     }
 
-    /// Com `cipher`, o payload vai cifrado (`sal ‖ texto cifrado`); o CRC
-    /// cobre o frame como gravado, então a leitura valida sem a chave.
+    /// Com `cipher`, o payload vai cifrado; o CRC cobre o frame como gravado, então a
+    /// leitura reconhece a cauda rasgada sem a chave. Cifra legada (v1):
+    /// `sal(4) ‖ texto cifrado`, sem etiqueta. Cifra autenticada (v2):
+    /// `nonce(12) ‖ texto cifrado ‖ etiqueta(16)`, e o frame sai como o primeiro de
+    /// um arquivo (sem frame anterior); os seguintes são encadeados por [`Wal::append`].
     pub fn encode_frame_with(&self, cipher: Option<&Cipher>) -> Vec<u8> {
+        self.encode_frame_after(cipher, 0)
+    }
+
+    /// Frame que vem depois do de LSN `prev_lsn` no arquivo (0 = é o primeiro). Só a
+    /// cifra autenticada usa `prev_lsn`: ele entra nos dados autenticados, e por isso um
+    /// frame removido, repetido ou fora de ordem não confere na leitura.
+    fn encode_frame_after(&self, cipher: Option<&Cipher>, prev_lsn: u64) -> Vec<u8> {
         let lsn = self.lsn();
         let (ty, payload) = self.encode_payload();
         let payload = match cipher {
-            Some(c) => c.seal_wal(lsn, &payload),
+            Some(c) => c.seal_wal(prev_lsn, lsn, ty, &payload),
             None => payload,
         };
         let mut body = Vec::with_capacity(9 + payload.len());
@@ -290,6 +302,9 @@ pub struct Wal {
     len: u64,
     /// LSN do primeiro registro no arquivo atual (`None` = só cabeçalho).
     first_lsn: Option<u64>,
+    /// LSN do último frame do arquivo atual (0 = só cabeçalho). Com cifra autenticada
+    /// entra nos dados autenticados do frame seguinte, encadeando os frames.
+    last_lsn: u64,
     /// Cauda que só a reabertura conserta: ver [`Wal::poison`].
     poisoned: bool,
 }
@@ -345,6 +360,7 @@ impl Wal {
             next_lsn,
             len: valid_len,
             first_lsn: records.first().map(WalRecord::lsn),
+            last_lsn: records.last().map_or(0, WalRecord::lsn),
             poisoned: false,
         })
     }
@@ -401,6 +417,7 @@ impl Wal {
         self.file = file;
         self.len = 8;
         self.first_lsn = None;
+        self.last_lsn = 0;
         self.next_lsn = next_lsn;
         Ok(Some(dest))
     }
@@ -426,7 +443,7 @@ impl Wal {
             | WalRecord::Expire { lsn: l, .. }
             | WalRecord::Time { lsn: l, .. } => *l = lsn,
         }
-        let frame = record.encode_frame_with(self.cipher.as_deref());
+        let frame = record.encode_frame_after(self.cipher.as_deref(), self.last_lsn);
         self.file.seek(SeekFrom::End(0))?;
         let previous_len = self.file.stream_position()?;
         if let Err(error) = self.file.write_all(&frame) {
@@ -444,6 +461,7 @@ impl Wal {
         self.next_lsn = lsn + 1;
         self.len += frame.len() as u64;
         self.first_lsn.get_or_insert(lsn);
+        self.last_lsn = lsn;
         Ok(lsn)
     }
 
@@ -462,6 +480,7 @@ impl Wal {
         self.next_lsn = next_lsn;
         self.len = 8;
         self.first_lsn = None;
+        self.last_lsn = 0;
         Ok(())
     }
 
@@ -471,6 +490,13 @@ impl Wal {
         Self::read_all_with(path, None)
     }
 
+    /// Como [`Wal::read_all`], decifrando com `cipher`. É a cifra que diz o formato do
+    /// frame, nunca o conteúdo do arquivo. Com cifra autenticada (v2), um frame que
+    /// chegou inteiro ao disco (o CRC confere) mas cuja etiqueta não confere, ou cujo LSN
+    /// não avança, foi alterado, removido, repetido ou trocado de lugar: dá `CorruptWal`
+    /// em qualquer posição, inclusive no fim. Continua valendo como cauda de escrita
+    /// interrompida o frame truncado ou com CRC ruim no fim do arquivo: quem altera o
+    /// arquivo consegue cortar o fim do log, mas não mudar o que fica.
     pub fn read_all_with(
         path: impl AsRef<Path>,
         cipher: Option<&Cipher>,
@@ -498,6 +524,7 @@ impl Wal {
             return Err(Error::CorruptWal(0));
         }
 
+        let authenticated = cipher.is_some_and(Cipher::is_authenticated);
         let mut records = Vec::new();
         let mut max_lsn = 0u64;
         let mut offset = 8u64;
@@ -532,7 +559,8 @@ impl Wal {
             let decoded = match cipher {
                 Some(c) if body.len() >= 9 => {
                     let lsn = u64::from_le_bytes(body[0..8].try_into().expect("8"));
-                    c.open_wal(lsn, &body[9..]).and_then(|plain| {
+                    // `max_lsn` é o LSN do frame anterior no arquivo (0 no primeiro).
+                    c.open_wal(max_lsn, lsn, body[8], &body[9..]).and_then(|plain| {
                         let mut full = body[..9].to_vec();
                         full.extend_from_slice(&plain);
                         WalRecord::decode_body(&full)
@@ -541,15 +569,15 @@ impl Wal {
                 _ => WalRecord::decode_body(&body),
             };
             match decoded {
-                Ok(rec) => {
-                    if rec.lsn() <= max_lsn || rec.lsn() == u64::MAX {
-                        break;
-                    }
+                Ok(rec) if rec.lsn() > max_lsn && rec.lsn() != u64::MAX => {
                     max_lsn = rec.lsn();
                     records.push(rec);
                     offset = frame_end;
                 }
-                Err(_) => break,
+                // Cifra autenticada: o frame está inteiro (o CRC confere), então não é
+                // escrita interrompida, é adulteração. Erro, em vez de parar em silêncio.
+                _ if authenticated => return Err(Error::CorruptWal(offset)),
+                _ => break,
             }
         }
 

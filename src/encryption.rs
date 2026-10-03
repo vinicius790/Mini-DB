@@ -19,14 +19,18 @@
 //!   zera). Bancos antigos continuam abrindo assim, sem migração automática;
 //!   [`convert`] com a mesma senha reescreve tudo em v2.
 //!
-//! No WAL, cada frame leva 4 bytes de sal + LSN como nonce, sem etiqueta; a
-//! integridade fica a cargo do CRC do WAL.
+//! No WAL, a cifra v2 grava cada payload como ChaCha20-Poly1305 com uma subchave
+//! só do WAL, nonce aleatório de 12 bytes e AAD com o LSN do frame anterior no
+//! arquivo, o LSN e o tipo do registro: frame alterado, removido, repetido ou fora
+//! de ordem dá [`Error::CorruptWal`]. Na v1 cada frame leva 4 bytes de sal + LSN
+//! como nonce, sem etiqueta; a integridade fica a cargo do CRC do WAL.
 //!
 //! O arquivo `data.mdb.key` guarda sal, iterações e um verificador da chave
 //! (nunca a chave). Sem ele o banco não é criptografado.
 
 use crate::crypto::{
-    aead_tag_of, chacha20_xor, constant_time_eq, hmac_sha256, pbkdf2_sha256, random_bytes,
+    aead_open, aead_seal, aead_tag_of, chacha20_xor, constant_time_eq, hmac_sha256, pbkdf2_sha256,
+    random_bytes,
 };
 use crate::error::{Error, Result};
 use crate::page::{Page, PageKind, PAGE_HEADER_SIZE, PAGE_SIZE};
@@ -53,6 +57,9 @@ const _: () = assert!(TAG_END + FIELDS_END - FIELDS_START == PAGE_HEADER_SIZE);
 
 pub struct Cipher {
     key: [u8; 32],
+    /// Subchave dos frames autenticados do WAL (v2): os nonces do WAL nunca
+    /// concorrem com os das páginas.
+    wal_key: [u8; 32],
     /// `true`: páginas v2 com etiqueta; `false`: formato legado (v1).
     authenticated: bool,
 }
@@ -66,8 +73,10 @@ impl std::fmt::Debug for Cipher {
 impl Cipher {
     /// Cifra com páginas autenticadas (v2): é o formato de todo banco novo.
     pub fn from_passphrase(passphrase: &str, salt: &[u8], iterations: u32) -> Self {
+        let key = pbkdf2_sha256(passphrase.as_bytes(), salt, iterations);
         Self {
-            key: pbkdf2_sha256(passphrase.as_bytes(), salt, iterations),
+            wal_key: hmac_sha256(&key, &[b"minidb wal v2 key"]),
+            key,
             authenticated: true,
         }
     }
@@ -169,8 +178,21 @@ impl Cipher {
         Ok(page)
     }
 
-    /// Cifra o payload de um frame do WAL: `sal(4) ‖ texto cifrado`.
-    pub fn seal_wal(&self, lsn: u64, payload: &[u8]) -> Vec<u8> {
+    /// Cifra o payload de um frame do WAL.
+    ///
+    /// - v2: `nonce(12) ‖ texto cifrado ‖ etiqueta(16)`. O nonce é aleatório porque
+    ///   um LSN pode voltar a ser usado com outro conteúdo (cauda descartada no
+    ///   recovery, restauração até um ponto). O AAD leva `prev_lsn` (LSN do frame
+    ///   anterior no arquivo, 0 no primeiro), o LSN e o tipo `ty`.
+    /// - v1: `sal(4) ‖ texto cifrado`, sem etiqueta; `prev_lsn` e `ty` não entram.
+    pub fn seal_wal(&self, prev_lsn: u64, lsn: u64, ty: u8, payload: &[u8]) -> Vec<u8> {
+        if self.authenticated {
+            let nonce = random_bytes::<12>();
+            let aad = wal_aad(prev_lsn, lsn, ty);
+            let mut out = nonce.to_vec();
+            out.extend_from_slice(&aead_seal(&self.wal_key, &nonce, &aad, payload));
+            return out;
+        }
         let salt = random_bytes::<4>();
         let mut out = Vec::with_capacity(4 + payload.len());
         out.extend_from_slice(&salt);
@@ -179,7 +201,19 @@ impl Cipher {
         out
     }
 
-    pub fn open_wal(&self, lsn: u64, data: &[u8]) -> Result<Vec<u8>> {
+    /// Abre o payload gravado por [`Cipher::seal_wal`]. Na v2, etiqueta que não confere
+    /// (byte alterado, outro frame anterior, LSN ou tipo trocados) dá [`Error::CorruptWal`].
+    pub fn open_wal(&self, prev_lsn: u64, lsn: u64, ty: u8, data: &[u8]) -> Result<Vec<u8>> {
+        if self.authenticated {
+            if data.len() < 12 {
+                return Err(Error::CorruptWal(lsn));
+            }
+            let (nonce, sealed) = data.split_at(12);
+            let nonce: [u8; 12] = nonce.try_into().expect("12 bytes");
+            let aad = wal_aad(prev_lsn, lsn, ty);
+            let plain = aead_open(&self.wal_key, &nonce, &aad, sealed);
+            return plain.ok_or(Error::CorruptWal(lsn));
+        }
         if data.len() < 4 {
             return Err(Error::CorruptWal(lsn));
         }
@@ -202,6 +236,17 @@ fn page_aad(page_id: u32) -> [u8; 18] {
     let mut aad = [0u8; 18];
     aad[..14].copy_from_slice(b"minidb page v2");
     aad[14..].copy_from_slice(&page_id.to_le_bytes());
+    aad
+}
+
+/// Dados autenticados de um frame v2 do WAL: rótulo do formato, LSN do frame
+/// anterior no arquivo (0 no primeiro), LSN e tipo do registro.
+fn wal_aad(prev_lsn: u64, lsn: u64, ty: u8) -> [u8; 30] {
+    let mut aad = [0u8; 30];
+    aad[..13].copy_from_slice(b"minidb wal v2");
+    aad[13..21].copy_from_slice(&prev_lsn.to_le_bytes());
+    aad[21..29].copy_from_slice(&lsn.to_le_bytes());
+    aad[29] = ty;
     aad
 }
 
@@ -441,10 +486,26 @@ mod tests {
         let back = old.open_page(7, &v1.data).unwrap();
         assert_eq!(&back.data[100..104], b"jogo");
         assert!(wrong.legacy().open_page(7, &v1.data).is_err());
-        let sealed = c.seal_wal(42, b"payload");
+        // WAL v2: etiqueta presa ao frame anterior, ao LSN e ao tipo.
+        let sealed = c.seal_wal(41, 42, 1, b"payload");
+        assert_eq!(sealed.len(), 12 + 7 + 16);
+        assert_eq!(c.open_wal(41, 42, 1, &sealed).unwrap(), b"payload");
+        assert!(c.open_wal(41, 43, 1, &sealed).is_err(), "outro LSN");
+        assert!(c.open_wal(40, 42, 1, &sealed).is_err(), "outro frame anterior");
+        assert!(c.open_wal(41, 42, 2, &sealed).is_err(), "outro tipo");
+        assert!(c.open_wal(41, 42, 1, &sealed[..20]).is_err(), "curto");
+        let other = Cipher::from_passphrase("outra", b"sal", 10);
+        assert!(other.open_wal(41, 42, 1, &sealed).is_err(), "outra chave");
+        for at in 0..sealed.len() {
+            let mut bad = sealed.clone();
+            bad[at] ^= 1;
+            assert!(c.open_wal(41, 42, 1, &bad).is_err(), "byte {at}");
+        }
+        // WAL v1 (legado): sem etiqueta, como antes.
+        let sealed = old.seal_wal(0, 42, 1, b"payload");
         assert_ne!(&sealed[4..], b"payload");
-        assert_eq!(c.open_wal(42, &sealed).unwrap(), b"payload");
-        assert_ne!(c.open_wal(43, &sealed).unwrap(), b"payload");
+        assert_eq!(old.open_wal(0, 42, 1, &sealed).unwrap(), b"payload");
+        assert_ne!(old.open_wal(0, 43, 1, &sealed).unwrap(), b"payload");
     }
 
     #[test]

@@ -64,8 +64,14 @@ Segurança
   página trocada de lugar ou cabeçalho adulterado dão `CorruptPage`; antes o CRC16 ficava
   em claro (refeito ou zerado por quem tem o arquivo). Bancos antigos (chave v1) abrem
   como antes, sem a proteção; `encrypt`/`rekey` (`convert`), mesmo com a mesma senha, os
-  migram para v2. Não cobre *replay* de uma versão antiga e válida da mesma página nem o
-  WAL cifrado (sem etiqueta).
+  migram para v2. Não cobre *replay* de uma versão antiga e válida da mesma página.
+- Criptografia em repouso: em bancos v2 os frames do WAL também são autenticados
+  (ChaCha20-Poly1305 com subchave do WAL, nonce aleatório de 12 bytes e AAD com o LSN do
+  frame anterior no arquivo, o LSN e o tipo; 24 bytes a mais por frame). Byte alterado,
+  tipo ou LSN trocados, frame removido, repetido ou fora de ordem dão `CorruptWal`, também
+  no último frame quando o CRC confere; truncamento ou CRC ruim no fim seguem como cauda
+  de escrita interrompida. O formato do frame em claro e o da cifra v1 não mudam. O
+  limite de tamanho de frame na leitura ganhou folga para chaves internas longas.
 
 Correções
 - WAL: `Begin` com operações pendentes de outra transação volta a ser erro (não
