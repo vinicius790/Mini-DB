@@ -3,7 +3,7 @@ use mini_db::mvcc::SharedDb;
 use mini_db::replication::{applied_lsn, enable_feed, run_replica, serve_primary};
 use mini_db::{Db, Error, ExecResult};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,7 @@ fn optimistic_transactions_detect_conflicts() {
     a.commit().unwrap();
     b.commit().unwrap(); // chaves disjuntas: sem conflito
     let mut c = shared.begin().unwrap();
-    shared.lock().unwrap().put(b"x", b"direto").unwrap();
+    shared.put(b"x", b"direto").unwrap();
     c.put(b"x", b"c").unwrap();
     assert!(matches!(c.commit(), Err(Error::Conflict(_))));
     assert!(shared.begin().unwrap().put(&[0xFF], b"v").is_err());
@@ -134,11 +134,15 @@ fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
     }
 }
 
+fn get_ok(db: &SharedDb, key: &[u8]) -> Option<Vec<u8>> {
+    db.read().ok().and_then(|g| g.get(key).ok().flatten())
+}
+
 #[test]
 fn replica_follows_primary_snapshot_then_stream_and_is_read_only() {
     let primary = SharedDb::new(Db::open(tmpdir("primary")).unwrap());
     // Estado anterior ao feed: chega à réplica por snapshot completo.
-    primary.lock().unwrap().put(b"antes", b"1").unwrap();
+    primary.put(b"antes", b"1").unwrap();
     primary
         .sql("CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -151,55 +155,50 @@ fn replica_follows_primary_snapshot_then_stream_and_is_read_only() {
         let (p, a) = (primary.clone(), addr.clone());
         thread::spawn(move || serve_primary(p, &a, 10_000));
     }
-    let replica_dir = tmpdir("replica");
-    let replica = Arc::new(Mutex::new(Db::open(&replica_dir).unwrap()));
-    replica.lock().unwrap().put(b"lixo-local", b"x").unwrap();
+    let replica = SharedDb::new(Db::open(tmpdir("replica")).unwrap());
+    replica.put(b"lixo-local", b"x").unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let follower = {
-        let (r, s, a) = (Arc::clone(&replica), Arc::clone(&stop), addr.clone());
+        let (r, s, a) = (replica.clone(), Arc::clone(&stop), addr.clone());
         thread::spawn(move || run_replica(r, &a, s))
     };
-    wait_until("snapshot", || {
-        replica.lock().unwrap().get(b"antes").unwrap().is_some()
-    });
+    wait_until("snapshot", || get_ok(&replica, b"antes").is_some());
     assert_eq!(
-        replica.lock().unwrap().get(b"lixo-local").unwrap(),
+        get_ok(&replica, b"lixo-local"),
         None,
         "snapshot substitui o estado"
     );
     // Mudanças novas chegam pelo stream, inclusive TTL e SQL.
     primary
-        .lock()
-        .unwrap()
         .put_with_ttl(b"ttl", b"v", Duration::from_secs(3600))
         .unwrap();
     primary
         .sql("INSERT INTO t2 VALUES (1, 'um'), (2, 'dois')")
         .unwrap();
-    primary.lock().unwrap().delete(b"antes").unwrap();
+    primary.delete(b"antes").unwrap();
     wait_until("stream", || {
-        replica.lock().unwrap().get(b"antes").unwrap().is_none()
+        get_ok(&replica, b"antes").is_none() && get_ok(&replica, b"ttl").is_some()
     });
     {
-        let mut r = replica.lock().unwrap();
+        let r = replica.read().unwrap();
         assert!(matches!(
             r.ttl(b"ttl").unwrap(),
             mini_db::KeyTtl::ExpiresIn(_)
         ));
-        let ExecResult::Table { rows, .. } = r.execute_sql("SELECT v FROM t2 ORDER BY id").unwrap()
+        let ExecResult::Table { rows, .. } = r.query("SELECT v FROM t2 ORDER BY id").unwrap()
         else {
             panic!()
         };
         assert_eq!(rows.len(), 2);
-        assert!(matches!(r.put(b"w", b"v"), Err(Error::ReadOnly)));
-        assert!(matches!(
-            r.execute_sql("INSERT INTO t2 VALUES (3, 'x')"),
-            Err(Error::ReadOnly)
-        ));
-        assert!(applied_lsn(&mut r).unwrap() > 0);
+        assert!(applied_lsn(&r).unwrap() > 0);
         r.verify().unwrap();
     }
+    assert!(matches!(replica.put(b"w", b"v"), Err(Error::ReadOnly)));
+    assert!(matches!(
+        replica.sql("INSERT INTO t2 VALUES (3, 'x')"),
+        Err(Error::ReadOnly)
+    ));
     stop.store(true, Ordering::Relaxed);
-    primary.lock().unwrap().put(b"acorda", b"1").unwrap(); // desbloqueia a leitura
+    primary.put(b"acorda", b"1").unwrap(); // desbloqueia a leitura
     follower.join().unwrap().unwrap();
 }

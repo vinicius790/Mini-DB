@@ -1,14 +1,18 @@
 //! Exclusões que esvaziam folhas inteiras e VACUUM que reconstrói a árvore.
 use mini_db::Db;
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-{tag}-{}-{}",
+        "minidb-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -43,7 +47,7 @@ fn emptied_leaves_keep_remaining_keys_reachable() {
     assert_eq!(db.scan(b"k", None).unwrap().len(), 150);
     db.close().unwrap();
     drop(db);
-    let mut db = Db::open(&dir).unwrap();
+    let db = Db::open(&dir).unwrap();
     assert_eq!(
         db.get(&key(110)).unwrap().as_deref(),
         Some(b"again".as_ref())
@@ -77,17 +81,26 @@ fn vacuum_rebuilds_tree_and_shrinks_file() {
     db.verify().unwrap();
     db.close().unwrap();
     drop(db);
-    let mut db = Db::open(&dir).unwrap();
+    let db = Db::open(&dir).unwrap();
     assert_eq!(db.get(&key(390)).unwrap(), Some(vec![b'x'; 100]));
     db.verify().unwrap();
 }
 
 #[test]
-fn value_index_reports_combined_size_limit() {
-    let dir = tmpdir("index-limit");
+fn value_index_accepts_values_of_any_size() {
+    let dir = tmpdir("index-any-size");
     let mut db = Db::open(&dir).unwrap();
     db.create_value_index().unwrap();
-    let err = db.put(b"key", &[b'v'; 200]).unwrap_err().to_string();
-    assert!(err.contains("índice por valor"), "{err}");
-    db.put(b"key", &[b'v'; 100]).unwrap();
+    let big = vec![b'v'; 3 << 20];
+    db.put(b"a", &big).unwrap();
+    db.put(b"b", &big).unwrap();
+    db.put(&[b'k'; 1024], b"curto").unwrap();
+    assert_eq!(
+        db.get_by_value(&big).unwrap(),
+        [b"a".to_vec(), b"b".to_vec()]
+    );
+    assert_eq!(db.get_by_value(b"curto").unwrap(), [vec![b'k'; 1024]]);
+    db.delete(b"a").unwrap();
+    assert_eq!(db.get_by_value(&big).unwrap(), [b"b".to_vec()]);
+    db.verify().unwrap();
 }

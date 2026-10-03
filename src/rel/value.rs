@@ -16,9 +16,11 @@ pub enum Type {
 impl Type {
     pub fn parse(word: &str) -> Option<Self> {
         Some(match word.to_ascii_uppercase().as_str() {
-            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" => Self::Int,
+            "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" => Self::Int,
             "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" | "DECIMAL" => Self::Real,
-            "TEXT" | "VARCHAR" | "CHAR" | "STRING" => Self::Text,
+            "TEXT" | "VARCHAR" | "CHAR" | "STRING" | "DATE" | "DATETIME" | "JSON" | "UUID" => {
+                Self::Text
+            }
             "BOOL" | "BOOLEAN" => Self::Bool,
             _ => return None,
         })
@@ -103,6 +105,28 @@ impl Value {
             (v @ Self::Text(_), Type::Text) => v,
             (v @ Self::Bool(_), Type::Bool) => v,
             (Self::Int(n @ (0 | 1)), Type::Bool) => Self::Bool(n == 1),
+            // Conversões de atribuição (como no PostgreSQL): número/booleano
+            // vira texto; texto numérico/booleano vira o tipo da coluna.
+            (v @ (Self::Int(_) | Self::Real(_) | Self::Bool(_)), Type::Text) => {
+                Self::Text(v.to_string())
+            }
+            (Self::Text(s), Type::Int) if s.trim().parse::<i64>().is_ok() => {
+                Self::Int(s.trim().parse().expect("verificado"))
+            }
+            (Self::Text(s), Type::Real) if s.trim().parse::<f64>().is_ok_and(|x| !x.is_nan()) => {
+                Self::Real(s.trim().parse().expect("verificado"))
+            }
+            (Self::Text(s), Type::Bool)
+                if matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "t" | "f" | "true" | "false" | "1" | "0"
+                ) =>
+            {
+                Self::Bool(matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "t" | "true" | "1"
+                ))
+            }
             (v, ty) => {
                 return Err(Error::Constraint(format!(
                     "valor {v} ({}) incompatível com {}",
@@ -120,6 +144,17 @@ impl Value {
             (Self::Int(a), Self::Int(b)) => Some(a.cmp(b)),
             (Self::Text(a), Self::Text(b)) => Some(a.cmp(b)),
             (Self::Bool(a), Self::Bool(b)) => Some(a.cmp(b)),
+            // Texto numérico compara com número (parâmetros e OIDs chegam como texto).
+            (Self::Text(s), n @ (Self::Int(_) | Self::Real(_)))
+            | (n @ (Self::Int(_) | Self::Real(_)), Self::Text(s)) => {
+                let x: f64 = s.trim().parse().ok()?;
+                let y = n.as_f64()?;
+                if matches!(self, Self::Text(_)) {
+                    x.partial_cmp(&y)
+                } else {
+                    y.partial_cmp(&x)
+                }
+            }
             (a, b) => a.as_f64()?.partial_cmp(&b.as_f64()?),
         }
     }
@@ -203,9 +238,15 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
                 out.push(3);
                 out.extend_from_slice(&x.to_le_bytes());
             }
-            Value::Text(s) => {
+            // Textos até 64 KiB usam o formato da 0.5; maiores, comprimento u32.
+            Value::Text(s) if s.len() <= u16::MAX as usize => {
                 out.push(4);
                 out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Value::Text(s) => {
+                out.push(5);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 out.extend_from_slice(s.as_bytes());
             }
         }
@@ -231,11 +272,17 @@ pub fn decode_row(b: &[u8]) -> Result<Vec<Value>> {
             1 => Value::Bool(take(&mut i, 1)?[0] != 0),
             2 => Value::Int(i64::from_le_bytes(take(&mut i, 8)?.try_into().expect("8"))),
             3 => Value::Real(f64::from_le_bytes(take(&mut i, 8)?.try_into().expect("8"))),
-            4 => {
-                let len = take(&mut i, 2)?;
-                let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+            4 | 5 => {
+                let len = if tag == 4 {
+                    let n = take(&mut i, 2)?;
+                    u16::from_le_bytes([n[0], n[1]]) as usize
+                } else {
+                    let n = take(&mut i, 4)?;
+                    u32::from_le_bytes([n[0], n[1], n[2], n[3]]) as usize
+                };
                 Value::Text(String::from_utf8(take(&mut i, len)?.to_vec()).map_err(|_| bad())?)
             }
+
             _ => return Err(bad()),
         });
     }
@@ -264,6 +311,8 @@ mod tests {
             Value::Bool(true),
         ];
         assert_eq!(decode_row(&encode_row(&row)).unwrap(), row);
+        let big = vec![Value::Text("x".repeat(70_000)), Value::Int(1)];
+        assert_eq!(decode_row(&encode_row(&big)).unwrap(), big);
         assert!(decode_row(&[5, 0, 9]).is_err());
     }
 }

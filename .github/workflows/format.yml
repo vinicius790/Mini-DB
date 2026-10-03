@@ -1,0 +1,34 @@
+# Formata o código com `cargo fmt` e grava o resultado num commit. Roda só quando
+# acionado à mão (aba Actions → format → Run workflow): útil para quem não tem o
+# Rust instalado e viu o passo `cargo fmt --check` do CI falhar.
+# Commits feitos por este workflow usam o GITHUB_TOKEN e não disparam o CI, e
+# "Re-run jobs" repete o commit antigo (falha de novo): o CI só roda no próximo push
+# (um commit vazio serve: git commit --allow-empty -m "ci" && git push).
+name: format
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - name: Gravar a formatação
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nada a formatar."
+          else
+            git commit -m "style: cargo fmt"
+            git push
+          fi

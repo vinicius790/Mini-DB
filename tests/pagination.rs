@@ -1,13 +1,18 @@
 use mini_db::db::Db;
+
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[test]
 fn cursor_does_not_repeat_boundary() {
     let path = std::env::temp_dir().join(format!(
-        "minidb-page-{}-{}",
+        "minidb-page-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
         let mut db = Db::open(&path).unwrap();

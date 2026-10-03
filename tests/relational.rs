@@ -142,12 +142,14 @@ fn planner_uses_primary_key_and_indexes() {
     let mut db = Db::open(tmpdir("plan")).unwrap();
     setup(&mut db);
     let plan = |db: &mut Db, sql: &str| ok(db, &format!("EXPLAIN {sql}"));
-    assert!(plan(&mut db, "SELECT * FROM users WHERE id = 2").contains("USING PRIMARY KEY (id=2)"));
+    assert!(
+        plan(&mut db, "SELECT * FROM users WHERE id = 2").contains("USING PRIMARY KEY (id)=(2)")
+    );
     assert!(
         plan(&mut db, "SELECT * FROM users WHERE id >= 2 AND id < 4").contains("PRIMARY KEY RANGE")
     );
     assert!(plan(&mut db, "SELECT * FROM users WHERE email = 'bia@x'")
-        .contains("UNIQUE INDEX users_email_key"));
+        .contains("UNIQUE INDEX users_email_key (email)=(bia@x)"));
     assert!(plan(&mut db, "SELECT * FROM orders WHERE user_id = 3").contains("INDEX orders_user"));
     assert!(plan(&mut db, "SELECT * FROM users WHERE age = 3").starts_with("SCAN users"));
     let j = plan(
@@ -253,7 +255,7 @@ fn ddl_alter_drop_and_catalog() {
     );
     assert_eq!(
         text(&q(&mut db, "SHOW TABLES")),
-        ["orders|4|1", "users|6|1"]
+        ["orders|table|4|1", "users|table|6|1"]
     );
     assert!(text(&q(&mut db, "DESCRIBE users"))[0].starts_with("id|INTEGER|true|true"));
     assert!(db.execute_sql("CREATE TABLE users (id INT)").is_err());

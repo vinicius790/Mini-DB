@@ -2,14 +2,18 @@
 
 use mini_db::Db;
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmpdir() -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-test-{}-{}",
+        "minidb-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -62,7 +66,7 @@ fn reopen_after_clean_close() {
         db.put(b"persist", b"yes").unwrap();
         db.close().unwrap();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(
         db.get(b"persist").unwrap().as_deref(),
         Some(b"yes".as_ref())

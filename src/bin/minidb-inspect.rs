@@ -18,16 +18,30 @@ fn run() -> mini_db::Result<()> {
         process::exit(2);
     }
     let dir = args.remove(0);
-    let mut db = Db::open(&dir)?;
+    // Banco cifrado: senha em MINIDB_PASSPHRASE. Abrir refaz o WAL em memória, mas
+    // o handle é largado sem checkpoint: a inspeção não reescreve `data.mdb`.
+    let secret = env::var("MINIDB_PASSPHRASE").unwrap_or_default();
+    let pass = (!secret.is_empty()).then_some(secret.as_str());
+    let db = Db::open_encrypted(dir, 1024, true, pass)?;
+    // Também em erro (page_id inválido, página corrompida): um `?` com o handle
+    // vivo deixaria o `Drop` fazer o checkpoint.
+    let result = inspect(&db, &args);
+    db.drop_without_checkpoint();
+    result
+}
+
+fn inspect(db: &Db, args: &[String]) -> mini_db::Result<()> {
     print!("{}", db.inspect_meta_text());
     if let Some(id_s) = args.first() {
         if id_s != "--hex" {
-            let id: u32 = id_s.parse().unwrap_or(0);
-            if args.iter().any(|a| a == "--hex") {
+            let id: u32 = id_s
+                .parse()
+                .map_err(|_| mini_db::Error::Cli(format!("page_id inválido: {id_s}")))?;
+            if let Some(at) = args.iter().position(|a| a == "--hex") {
+                // O tamanho é o argumento logo depois de `--hex` (padrão: 256 bytes).
                 let n = args
-                    .iter()
-                    .rev()
-                    .find_map(|a| a.parse::<usize>().ok())
+                    .get(at + 1)
+                    .and_then(|a| a.parse::<usize>().ok())
                     .unwrap_or(256);
                 print!("{}", db.inspect_hex(id, n)?);
             } else {
@@ -35,6 +49,5 @@ fn run() -> mini_db::Result<()> {
             }
         }
     }
-    db.close()?;
     Ok(())
 }

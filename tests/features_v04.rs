@@ -3,21 +3,27 @@ use mini_db::{BatchOp, Db, ExecResult, KeyTtl};
 use std::thread::sleep;
 use std::time::Duration;
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-v04-{tag}-{}-{}",
+        "minidb-v04-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
 
-const SHORT: Duration = Duration::from_millis(40);
-const WAIT: Duration = Duration::from_millis(120);
+// Folga generosa: em máquinas lentas (fsync no Windows) uma escrita passa de 40 ms,
+// e a chave expirava antes da primeira conferência.
+const SHORT: Duration = Duration::from_secs(1);
+const WAIT: Duration = Duration::from_secs(2);
 const LONG: Duration = Duration::from_secs(3600);
 
 #[test]
@@ -153,7 +159,7 @@ fn batch_is_atomic_across_crash() {
     ]);
     assert!(invalid.is_err());
     db.drop_without_checkpoint();
-    let mut db = Db::open(&dir).unwrap();
+    let db = Db::open(&dir).unwrap();
     let keys: Vec<_> = db
         .scan(b"\0", None)
         .unwrap()
@@ -230,8 +236,9 @@ fn page_stats_track_empty_leaves_and_vacuum() {
 
 #[test]
 fn cli_commands_cover_new_features() {
-    let mut db = Db::open(tmpdir("cli")).unwrap();
-    let mut run = |line: &str| mini_db::cmd::apply(&mut db, line).unwrap();
+    let db = mini_db::mvcc::SharedDb::new(Db::open(tmpdir("cli")).unwrap());
+    let session = std::cell::RefCell::new(db.session());
+    let run = |line: &str| mini_db::cmd::apply(&mut session.borrow_mut(), line).unwrap();
     assert!(run("SETEX s 3600 valor com espaços").starts_with("OK"));
     assert!(run("TTL s").starts_with("ttl_ms="));
     assert_eq!(run("PERSIST s"), "OK\n");

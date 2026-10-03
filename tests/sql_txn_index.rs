@@ -3,14 +3,18 @@
 use mini_db::db::ExecResult;
 use mini_db::Db;
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmpdir() -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-test-{}-{}",
+        "minidb-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -27,7 +31,7 @@ fn delete_and_reopen() {
         assert_eq!(db.get(b"drop").unwrap(), None);
         db.close().unwrap();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(db.get(b"keep").unwrap().as_deref(), Some(b"1".as_ref()));
     assert_eq!(db.get(b"drop").unwrap(), None);
 }
@@ -62,7 +66,7 @@ fn txn_crash_without_commit_is_aborted() {
         // WAL ainda não tem COMMIT; abandonar sem close/checkpoint.
         db.drop_without_checkpoint();
     }
-    let mut db = Db::open(dir.as_path()).unwrap();
+    let db = Db::open(dir.as_path()).unwrap();
     assert_eq!(db.get(b"stable").unwrap().as_deref(), Some(b"s".as_ref()));
     // ghost só existia no write-set em memória — sem BEGIN no WAL se rollback...
     // begin() não grava WAL até commit(). Logo ghost some. Correto.

@@ -2,12 +2,14 @@ services:
   minidb:
     build: .
     ports:
-      - "8080:8080"
-      - "7432:7432"
+      # Só no loopback do host: sem token/usuários a API é aberta.
+      - "127.0.0.1:8080:8080"
     volumes:
       - minidb-data:/data
     environment:
       MINIDB_PATH: /data
       MINIDB_HTTP: 0.0.0.0:8080
+      # Descomente para exigir "Authorization: Bearer <token>":
+      # MINIDB_TOKEN: troque-por-um-segredo-longo
 volumes:
   minidb-data:

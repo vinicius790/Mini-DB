@@ -4,6 +4,13 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -16,13 +23,18 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      # `!cancelled()`: clippy e doc rodam mesmo se o passo anterior falhar, para
+      # uma só execução mostrar todos os problemas.
       - run: cargo clippy --all-targets --all-features -- -D warnings
+        if: ${{ !cancelled() }}
       - run: cargo doc --no-deps
+        if: ${{ !cancelled() }}
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Sem `needs: lint`: compilação e testes rodam mesmo se o estilo falhar, e uma
+  # só execução mostra todos os problemas.
   test:
-    needs: lint
     strategy:
       fail-fast: false
       matrix:
@@ -31,9 +43,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0
-      - run: cargo test --all-targets --locked
+      # `--no-fail-fast`: um teste que falha não esconde os arquivos de teste seguintes.
+      - run: cargo test --all-targets --locked --no-fail-fast
       - run: cargo test --doc
+        if: ${{ !cancelled() }}
       - run: cargo build --bins --lib --locked
+        if: ${{ !cancelled() }}
 
   stress:
     needs: lint

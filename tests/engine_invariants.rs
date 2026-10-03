@@ -4,14 +4,18 @@ use mini_db::replica::{compare_sample, open_standby, ship_snapshot};
 use mini_db::{Db, MAX_KEY_LEN};
 use std::fs;
 
+/// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
+static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
-        "minidb-{tag}-{}-{}",
+        "minidb-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::create_dir_all(&p).unwrap();
     p
@@ -84,7 +88,7 @@ fn replica_ship_rejects_open_primary() {
     primary.close().unwrap();
     drop(primary);
     ship_snapshot(&src, &dst).unwrap();
-    let mut standby = open_standby(&dst).unwrap();
+    let standby = open_standby(&dst).unwrap();
     assert_eq!(standby.get(b"a").unwrap().as_deref(), Some(b"1".as_ref()));
 }
 

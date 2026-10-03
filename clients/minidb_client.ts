@@ -1,11 +1,26 @@
 /** Cliente HTTP fetch para Mini-DB (Node 18+ / browser). */
 export class MiniDbClient {
-  constructor(private base = "http://127.0.0.1:8080") {}
+  /** `auth.token` envia `Authorization: Bearer`; `auth.username`/`password`, `Basic`. */
+  constructor(
+    private base = "http://127.0.0.1:8080",
+    private auth: { token?: string; username?: string; password?: string } = {},
+  ) {}
+
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.auth.username !== undefined) {
+      const bytes = new TextEncoder().encode(`${this.auth.username}:${this.auth.password ?? ""}`);
+      headers.authorization = `Basic ${btoa(String.fromCharCode(...bytes))}`;
+    } else if (this.auth.token !== undefined) {
+      headers.authorization = `Bearer ${this.auth.token}`;
+    }
+    return headers;
+  }
 
   private async req(method: string, path: string, body?: unknown) {
     const res = await fetch(this.base + path, {
       method,
-      headers: { "content-type": "application/json" },
+      headers: this.headers(),
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const ct = res.headers.get("content-type") || "";
@@ -125,8 +140,9 @@ export class MiniDbClient {
   pages() {
     return this.req("GET", "/v1/pages");
   }
-  sql(sql: string) {
-    return this.req("POST", "/v1/sql", { sql });
+  /** `params` (null/bool/número/texto) preenche `?`, `?N` e `$N`. */
+  sql(sql: string, params?: Array<string | number | boolean | null>) {
+    return this.req("POST", "/v1/sql", params === undefined ? { sql } : { sql, params });
   }
   metrics(): Promise<string> {
     return this.req("GET", "/metrics") as Promise<string>;

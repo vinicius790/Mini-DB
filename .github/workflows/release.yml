@@ -1,0 +1,71 @@
+# Publica uma versão: roda só quando uma tag `v*` é enviada (ex.: `git tag v1.3.1 && git push --tags`).
+# Gera binários para Linux, macOS e Windows no GitHub Release e a imagem Docker no ghcr.io.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: cargo test --all-targets --locked
+      - run: cargo build --release --locked --bins
+      - name: Empacotar
+        shell: bash
+        run: |
+          mkdir dist
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          for bin in minidb minidb-bench minidb-inspect minidb-verify; do
+            cp "target/release/$bin$ext" dist/
+          done
+          cp README.md LICENSE CHANGELOG.md SECURITY.md minidb.toml dist/
+          pkg="minidb-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            (cd dist && 7z a "../$pkg.zip" .)
+          else
+            tar -czf "$pkg.tar.gz" -C dist .
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            minidb-*.tar.gz
+            minidb-*.zip
+
+  docker:
+    # Só publica a imagem depois que os testes (job `binaries`) passarem.
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Nomes de imagem no ghcr.io precisam ser minúsculos.
+          tags: |
+            ghcr.io/vinicius790/mini-db:${{ github.ref_name }}
+            ghcr.io/vinicius790/mini-db:latest

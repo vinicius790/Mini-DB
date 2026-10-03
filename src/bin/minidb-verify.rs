@@ -6,9 +6,14 @@ use std::process;
 
 fn main() {
     let dir = env::args().nth(1).unwrap_or_else(|| "./data".into());
-    match Db::open(&dir).and_then(|mut db| {
+    // Banco cifrado: senha em MINIDB_PASSPHRASE. Abrir refaz o WAL em memória, mas
+    // o handle é largado sem checkpoint: a verificação não reescreve `data.mdb`.
+    let secret = env::var("MINIDB_PASSPHRASE").unwrap_or_default();
+    let pass = (!secret.is_empty()).then_some(secret.as_str());
+    let opened = Db::open_encrypted(dir, 1024, true, pass);
+    match opened.and_then(|db| {
         let r = db.verify();
-        let _ = db.close();
+        db.drop_without_checkpoint();
         r
     }) {
         Ok(r) => {

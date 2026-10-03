@@ -18,7 +18,12 @@ wait "$PID" 2>/dev/null || true
 echo "wal.log: $(wc -c < "$DATA/wal.log") bytes (operações ainda não publicadas em data.mdb)"
 
 echo "== reabertura com recover =="
-"$BIN" exec "$DATA" GET hero
+# Os dados confirmados antes do kill -9 precisam voltar; senão o script falha.
+hero="$("$BIN" exec "$DATA" GET hero)"
+castle="$("$BIN" exec "$DATA" GET castle)"
+[ "$hero" = "alucard" ] || { echo "FALHA: hero='$hero' (esperado alucard)"; exit 1; }
+[ "$castle" = "dracula" ] || { echo "FALHA: castle='$castle' (esperado dracula)"; exit 1; }
 "$BIN" exec "$DATA" SCAN a z
 "$BIN" exec "$DATA" VERIFY
-echo "ok — dados em $DATA"
+rm -rf "$DATA"
+echo "ok — recuperação confirmada"

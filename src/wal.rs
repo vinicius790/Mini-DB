@@ -4,9 +4,15 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::encryption::Cipher;
 use crate::error::{Error, Result};
+use std::sync::Arc;
 
 pub const WAL_MAGIC: [u8; 4] = *b"MWAL";
+/// Maior corpo de frame aceito na leitura: um valor máximo com chave e cabeçalhos. A
+/// folga cobre a chave interna mais longa (64 bytes além da pública), os campos de
+/// tamanho e o nonce com a etiqueta do frame autenticado (28 bytes).
+const MAX_FRAME_BODY: u64 = (crate::page::MAX_VALUE_LEN + crate::page::MAX_KEY_LEN + 128) as u64;
 pub const WAL_VERSION: u32 = 1;
 
 pub const REC_INSERT: u8 = 1;
@@ -17,6 +23,8 @@ pub const REC_COMMIT: u8 = 5;
 pub const REC_ABORT: u8 = 6;
 /// Define (`expires_at > 0`) ou remove (`0`) a expiração de uma chave.
 pub const REC_EXPIRE: u8 = 7;
+/// Marca de relógio (ms Unix): permite restaurar até um instante (PITR).
+pub const REC_TIME: u8 = 8;
 
 /// Registro lógico do WAL.
 #[derive(Debug, Clone)]
@@ -55,6 +63,11 @@ pub enum WalRecord {
         /// Milissegundos desde a época Unix; 0 remove o TTL.
         expires_at: u64,
     },
+    /// Relógio de parede no momento do registro seguinte (ms Unix).
+    Time {
+        lsn: u64,
+        unix_ms: u64,
+    },
 }
 
 impl WalRecord {
@@ -66,7 +79,8 @@ impl WalRecord {
             | Self::Begin { lsn, .. }
             | Self::Commit { lsn, .. }
             | Self::Abort { lsn, .. }
-            | Self::Expire { lsn, .. } => *lsn,
+            | Self::Expire { lsn, .. }
+            | Self::Time { lsn, .. } => *lsn,
         }
     }
 
@@ -112,13 +126,34 @@ impl WalRecord {
                 p.extend_from_slice(&expires_at.to_le_bytes());
                 (REC_EXPIRE, p)
             }
+            Self::Time { unix_ms, .. } => (REC_TIME, unix_ms.to_le_bytes().to_vec()),
         }
     }
 
     /// Frame: `[payload_len:u32][crc32:u32][lsn:u64][type:u8][payload...]`
     pub fn encode_frame(&self) -> Vec<u8> {
+        self.encode_frame_with(None)
+    }
+
+    /// Com `cipher`, o payload vai cifrado; o CRC cobre o frame como gravado, então a
+    /// leitura reconhece a cauda rasgada sem a chave. Cifra legada (v1):
+    /// `sal(4) ‖ texto cifrado`, sem etiqueta. Cifra autenticada (v2):
+    /// `nonce(12) ‖ texto cifrado ‖ etiqueta(16)`, e o frame sai como o primeiro de
+    /// um arquivo (sem frame anterior); os seguintes são encadeados por [`Wal::append`].
+    pub fn encode_frame_with(&self, cipher: Option<&Cipher>) -> Vec<u8> {
+        self.encode_frame_after(cipher, 0)
+    }
+
+    /// Frame que vem depois do de LSN `prev_lsn` no arquivo (0 = é o primeiro). Só a
+    /// cifra autenticada usa `prev_lsn`: ele entra nos dados autenticados, e por isso um
+    /// frame removido, repetido ou fora de ordem não confere na leitura.
+    fn encode_frame_after(&self, cipher: Option<&Cipher>, prev_lsn: u64) -> Vec<u8> {
         let lsn = self.lsn();
         let (ty, payload) = self.encode_payload();
+        let payload = match cipher {
+            Some(c) => c.seal_wal(prev_lsn, lsn, ty, &payload),
+            None => payload,
+        };
         let mut body = Vec::with_capacity(9 + payload.len());
         body.extend_from_slice(&lsn.to_le_bytes());
         body.push(ty);
@@ -196,6 +231,15 @@ impl WalRecord {
                     _ => Self::Abort { lsn, txn_id },
                 })
             }
+            REC_TIME => {
+                if payload.len() != 8 {
+                    return Err(Error::CorruptWal(lsn));
+                }
+                Ok(Self::Time {
+                    lsn,
+                    unix_ms: u64::from_le_bytes(payload.try_into().expect("8")),
+                })
+            }
             REC_EXPIRE => {
                 if payload.len() < 4 {
                     return Err(Error::CorruptWal(lsn));
@@ -239,7 +283,12 @@ const CRC32_TABLE: [u32; 256] = {
 
 /// CRC32 IEEE (refletido, polinômio 0xEDB88320), por tabela.
 pub fn crc32(data: &[u8]) -> u32 {
-    !data.iter().fold(0xFFFF_FFFF, |crc, &b| {
+    !crc32_update(0xFFFF_FFFF, data)
+}
+
+/// Passo incremental do CRC32: comece com `0xFFFF_FFFF` e inverta no fim.
+pub fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    data.iter().fold(crc, |crc, &b| {
         (crc >> 8) ^ CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize]
     })
 }
@@ -247,11 +296,31 @@ pub fn crc32(data: &[u8]) -> u32 {
 pub struct Wal {
     path: PathBuf,
     file: File,
+    cipher: Option<Arc<Cipher>>,
     next_lsn: u64,
+    /// Tamanho do arquivo (cabeçalho + frames válidos).
+    len: u64,
+    /// LSN do primeiro registro no arquivo atual (`None` = só cabeçalho).
+    first_lsn: Option<u64>,
+    /// LSN do último frame do arquivo atual (0 = só cabeçalho). Com cifra autenticada
+    /// entra nos dados autenticados do frame seguinte, encadeando os frames.
+    last_lsn: u64,
+    /// Cauda que só a reabertura conserta: ver [`Wal::poison`].
+    poisoned: bool,
 }
+
+const POISONED: &str = "WAL com transação incompleta: reabra o banco para recuperar";
 
 impl Wal {
     pub fn open(path: impl AsRef<Path>, next_lsn: u64) -> Result<Self> {
+        Self::open_with(path, next_lsn, None)
+    }
+
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        next_lsn: u64,
+        cipher: Option<Arc<Cipher>>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
@@ -274,10 +343,10 @@ impl Wal {
         }
         // Remove the invalid tail before appending: otherwise future records
         // would remain hidden behind it after a second crash.
-        let (_, records) = Self::read_all(&path)?;
+        let (_, records) = Self::read_all_with(&path, cipher.as_deref())?;
         let valid_len = 8 + records
             .iter()
-            .map(|r| r.encode_frame().len() as u64)
+            .map(|r| r.encode_frame_with(cipher.as_deref()).len() as u64)
             .sum::<u64>();
         if file.metadata()?.len() != valid_len {
             file.set_len(valid_len)?;
@@ -287,8 +356,70 @@ impl Wal {
         Ok(Self {
             path,
             file,
+            cipher,
             next_lsn,
+            len: valid_len,
+            first_lsn: records.first().map(WalRecord::lsn),
+            last_lsn: records.last().map_or(0, WalRecord::lsn),
+            poisoned: false,
         })
+    }
+
+    /// Recusa novas escritas até a reabertura. Usado quando a cauda do arquivo ficou
+    /// com um frame BEGIN que nem o `Abort` conseguiu fechar (ou com um append parcial
+    /// que não pôde ser revertido): um registro gravado depois dela seria descartado
+    /// pelo recovery mesmo já confirmado ao cliente. A reabertura fecha o frame.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Erro se o WAL foi marcado por [`Wal::poison`].
+    pub(crate) fn check_usable(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Other(POISONED.into()));
+        }
+        Ok(())
+    }
+
+    pub fn cipher(&self) -> Option<Arc<Cipher>> {
+        self.cipher.clone()
+    }
+
+    /// Bytes ocupados pelo WAL atual.
+    pub fn size(&self) -> u64 {
+        self.len
+    }
+
+    /// Move o WAL atual para `archive_dir` (nome `<primeiro>-<último>.wal`,
+    /// ordenável) e recomeça um arquivo vazio. Usado no lugar do truncate
+    /// quando réplicas precisam do histórico. Sem registros, só trunca.
+    pub fn archive(&mut self, archive_dir: &Path, next_lsn: u64) -> Result<Option<PathBuf>> {
+        let Some(first) = self.first_lsn else {
+            self.truncate_after_checkpoint(next_lsn)?;
+            return Ok(None);
+        };
+        self.file.sync_all()?;
+        std::fs::create_dir_all(archive_dir)?;
+        let last = self.next_lsn.saturating_sub(1);
+        let dest = archive_dir.join(format!("{first:020}-{last:020}.wal"));
+        std::fs::rename(&self.path, &dest)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)?;
+        file.write_all(&WAL_MAGIC)?;
+        file.write_all(&WAL_VERSION.to_le_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        File::open(self.path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+        self.file = file;
+        self.len = 8;
+        self.first_lsn = None;
+        self.last_lsn = 0;
+        self.next_lsn = next_lsn;
+        Ok(Some(dest))
     }
 
     pub fn path(&self) -> &Path {
@@ -300,6 +431,7 @@ impl Wal {
     }
 
     pub fn append(&mut self, mut record: WalRecord) -> Result<u64> {
+        self.check_usable()?;
         let lsn = self.next_lsn;
         match &mut record {
             WalRecord::Insert { lsn: l, .. }
@@ -308,15 +440,18 @@ impl Wal {
             | WalRecord::Begin { lsn: l, .. }
             | WalRecord::Commit { lsn: l, .. }
             | WalRecord::Abort { lsn: l, .. }
-            | WalRecord::Expire { lsn: l, .. } => *l = lsn,
+            | WalRecord::Expire { lsn: l, .. }
+            | WalRecord::Time { lsn: l, .. } => *l = lsn,
         }
-        let frame = record.encode_frame();
+        let frame = record.encode_frame_after(self.cipher.as_deref(), self.last_lsn);
         self.file.seek(SeekFrom::End(0))?;
         let previous_len = self.file.stream_position()?;
         if let Err(error) = self.file.write_all(&frame) {
             let rollback = self.file.set_len(previous_len);
             let _ = self.file.seek(SeekFrom::End(0));
             if rollback.is_err() {
+                // O frame parcial ficou no arquivo e esconderia o que viesse depois dele.
+                self.poisoned = true;
                 return Err(Error::Other(format!(
                     "falha ao reverter append parcial do WAL: {error}"
                 )));
@@ -324,6 +459,9 @@ impl Wal {
             return Err(error.into());
         }
         self.next_lsn = lsn + 1;
+        self.len += frame.len() as u64;
+        self.first_lsn.get_or_insert(lsn);
+        self.last_lsn = lsn;
         Ok(lsn)
     }
 
@@ -340,11 +478,29 @@ impl Wal {
         self.file.seek(SeekFrom::Start(8))?;
         self.file.sync_all()?;
         self.next_lsn = next_lsn;
+        self.len = 8;
+        self.first_lsn = None;
+        self.last_lsn = 0;
         Ok(())
     }
 
-    /// Lê todos os registros válidos; para no primeiro frame truncado/CRC inválido.
+    /// Lê todos os registros válidos. Para na cauda truncada ou com CRC ruim (escrita
+    /// interrompida); CRC ruim seguido de dados não nulos é corrupção e dá `CorruptWal`.
     pub fn read_all(path: impl AsRef<Path>) -> Result<(u64, Vec<WalRecord>)> {
+        Self::read_all_with(path, None)
+    }
+
+    /// Como [`Wal::read_all`], decifrando com `cipher`. É a cifra que diz o formato do
+    /// frame, nunca o conteúdo do arquivo. Com cifra autenticada (v2), um frame que
+    /// chegou inteiro ao disco (o CRC confere) mas cuja etiqueta não confere, ou cujo LSN
+    /// não avança, foi alterado, removido, repetido ou trocado de lugar: dá `CorruptWal`
+    /// em qualquer posição, inclusive no fim. Continua valendo como cauda de escrita
+    /// interrompida o frame truncado ou com CRC ruim no fim do arquivo: quem altera o
+    /// arquivo consegue cortar o fim do log, mas não mudar o que fica.
+    pub fn read_all_with(
+        path: impl AsRef<Path>,
+        cipher: Option<&Cipher>,
+    ) -> Result<(u64, Vec<WalRecord>)> {
         let path = path.as_ref();
         if !path.exists() {
             return Ok((1, Vec::new()));
@@ -368,6 +524,7 @@ impl Wal {
             return Err(Error::CorruptWal(0));
         }
 
+        let authenticated = cipher.is_some_and(Cipher::is_authenticated);
         let mut records = Vec::new();
         let mut max_lsn = 0u64;
         let mut offset = 8u64;
@@ -381,7 +538,7 @@ impl Wal {
             let payload_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as u64;
             let crc_expected = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
             let frame_end = offset + 8 + payload_len;
-            if !(9..=16 * 1024 * 1024).contains(&payload_len) || frame_end > file_len {
+            if !(9..=MAX_FRAME_BODY).contains(&payload_len) || frame_end > file_len {
                 // Truncamento mid-write (crash kill -9) — para com segurança.
                 break;
             }
@@ -390,24 +547,58 @@ impl Wal {
                 break;
             }
             if crc32(&body) != crc_expected {
-                // CRC inválido = registro parcial ou corrupção; ignora daqui pra frente.
+                // Cauda de escrita interrompida: o frame ruim é o último, ou depois dele
+                // só há zeros (arquivo estendido sem os dados chegarem ao disco numa
+                // queda de energia): ignora. Com dados depois dele é corrupção no meio
+                // do log: erro, em vez de descartar transações já confirmadas.
+                if frame_end < file_len && !only_zeros_from(&mut file, frame_end)? {
+                    return Err(Error::CorruptWal(offset));
+                }
                 break;
             }
-            match WalRecord::decode_body(&body) {
-                Ok(rec) => {
-                    if rec.lsn() <= max_lsn || rec.lsn() == u64::MAX {
-                        break;
-                    }
+            let decoded = match cipher {
+                Some(c) if body.len() >= 9 => {
+                    let lsn = u64::from_le_bytes(body[0..8].try_into().expect("8"));
+                    // `max_lsn` é o LSN do frame anterior no arquivo (0 no primeiro).
+                    c.open_wal(max_lsn, lsn, body[8], &body[9..])
+                        .and_then(|plain| {
+                            let mut full = body[..9].to_vec();
+                            full.extend_from_slice(&plain);
+                            WalRecord::decode_body(&full)
+                        })
+                }
+                _ => WalRecord::decode_body(&body),
+            };
+            match decoded {
+                Ok(rec) if rec.lsn() > max_lsn && rec.lsn() != u64::MAX => {
                     max_lsn = rec.lsn();
                     records.push(rec);
                     offset = frame_end;
                 }
-                Err(_) => break,
+                // Cifra autenticada: o frame está inteiro (o CRC confere), então não é
+                // escrita interrompida, é adulteração. Erro, em vez de parar em silêncio.
+                _ if authenticated => return Err(Error::CorruptWal(offset)),
+                _ => break,
             }
         }
 
         let next_lsn = if max_lsn == 0 { 1 } else { max_lsn + 1 };
         Ok((next_lsn, records))
+    }
+}
+
+/// `true` se o arquivo só tem zeros de `from` até o fim.
+fn only_zeros_from(file: &mut File, from: u64) -> Result<bool> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
     }
 }
 
@@ -424,5 +615,20 @@ mod tests {
     #[test]
     fn crc32_matches_reference_vector() {
         assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn poisoned_wal_refuses_appends() {
+        let name = format!("minidb-wal-poison-{}.log", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        let mut wal = super::Wal::open(&path, 1).unwrap();
+        let begin = super::WalRecord::Begin { lsn: 0, txn_id: 1 };
+        assert_eq!(wal.append(begin.clone()).unwrap(), 1);
+        wal.poison();
+        assert!(wal.append(begin).is_err());
+        assert_eq!(wal.next_lsn(), 2);
+        drop(wal);
+        std::fs::remove_file(&path).unwrap();
     }
 }

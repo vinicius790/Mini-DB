@@ -69,8 +69,8 @@ limites de crash: [RECOVERY.md](RECOVERY.md) e [WAL.md](WAL.md).
 
 CLI e TCP compartilham o interpretador de comandos. HTTP implementa HTTP/1.1 simples
 com JSON e CORS; a ABI C oferece formas NUL-terminated e binárias. Cada servidor cria
-uma thread por conexão, com no máximo 128 conexões ativas, e protege um único `Db` por
-`Mutex`: as operações de banco são serializadas. Os clientes Python/TypeScript são
+uma thread por conexão (limite configurável) sobre um `SharedDb`: leitores em paralelo
+(`RwLock`), escritor único cujo `fsync` acontece sem bloquear leitores. Os clientes Python/TypeScript são
 exemplos sobre HTTP.
 
 A configuração vem de `minidb.toml` e pode ser substituída por `MINIDB_*`. O `LOCK` é
@@ -79,5 +79,9 @@ failover ([REPLICA.md](REPLICA.md)).
 
 ## Limites deliberados
 
-Sem SQL geral, JOIN, MVCC, autenticação, replicação contínua, alta disponibilidade ou
-garantias de energia independentes do filesystem. Escopo: [ESCOPO-0.4.md](ESCOPO-0.4.md) (histórico: [0.3](ESCOPO-0.3.md)).
+Os limites deliberados das versões anteriores (SQL, concorrência, replicação,
+tamanhos) foram removidos na 0.6: veja [MOTOR-0.6.md](MOTOR-0.6.md). O SQL da 0.7
+(integridade referencial, views, janelas, CTEs recursivas, sessões) está em
+[SQL.md](SQL.md); o código vive em `src/rel/` (`parser.rs`, `exec.rs` consultas e
+planejador, `write.rs` DDL/DML e integridade, `window.rs`, `func.rs`). Histórico:
+[0.5](MOTOR-0.5.md), [0.4](ESCOPO-0.4.md), [0.3](ESCOPO-0.3.md).

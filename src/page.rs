@@ -6,9 +6,30 @@ pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_HEADER_SIZE: usize = 32;
 pub const MAGIC: [u8; 4] = *b"MDB1";
 
-/// Limites pedagógicos: célula deve caber em uma folha com margem.
-pub const MAX_KEY_LEN: usize = 128;
-pub const MAX_VALUE_LEN: usize = 1024;
+/// Maior chave aceita pela API (1 KiB). Chaves ficam sempre dentro da página.
+pub const MAX_KEY_LEN: usize = 1024;
+/// Maior chave interna de árvore: a chave do usuário mais o prefixo das
+/// entradas de índice (hash do valor, ids de tabela).
+pub const MAX_TREE_KEY: usize = MAX_KEY_LEN + 64;
+/// Maior valor aceito (64 MiB). Valores grandes vão para páginas de overflow.
+pub const MAX_VALUE_LEN: usize = 64 << 20;
+/// Maior célula (com o slot) que uma página aceita: 1/3 do espaço útil, o que
+/// garante que qualquer split por bytes produza duas metades válidas.
+pub const MAX_CELL: usize = (PAGE_SIZE - PAGE_HEADER_SIZE) / 3 - 2;
+/// Bytes de valor por página de overflow.
+pub const OVERFLOW_CAPACITY: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
+/// Bit de `val_len` que marca valor em overflow.
+pub const VAL_OVERFLOW: u16 = 0x8000;
+/// Tamanho do ponteiro de overflow guardado na célula.
+pub const OVERFLOW_POINTER_LEN: usize = 8;
+
+/// Célula de folha em memória (splits, compactação e VACUUM).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafEntry {
+    pub key: Vec<u8>,
+    pub val: Vec<u8>,
+    pub overflow: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -17,6 +38,8 @@ pub enum PageKind {
     Meta = 1,
     Internal = 2,
     Leaf = 3,
+    /// Pedaço de um valor grande (encadeado por `right_sibling`).
+    Overflow = 4,
 }
 
 impl PageKind {
@@ -26,6 +49,7 @@ impl PageKind {
             1 => Some(Self::Meta),
             2 => Some(Self::Internal),
             3 => Some(Self::Leaf),
+            4 => Some(Self::Overflow),
             _ => None,
         }
     }
@@ -238,13 +262,15 @@ impl Page {
                             .try_into()
                             .map_err(|_| Error::CorruptPage(self.page_id()))?,
                     ) as usize;
-                    let value_len = u16::from_le_bytes(
+                    let raw = u16::from_le_bytes(
                         self.data[ptr + 2..ptr + 4]
                             .try_into()
                             .map_err(|_| Error::CorruptPage(self.page_id()))?,
-                    ) as usize;
-                    if key_len > MAX_KEY_LEN
-                        || value_len > MAX_VALUE_LEN + 1 // +1: tag do codec
+                    );
+                    let value_len = (raw & !VAL_OVERFLOW) as usize;
+                    let bad_pointer = raw & VAL_OVERFLOW != 0 && value_len != OVERFLOW_POINTER_LEN;
+                    if key_len > MAX_TREE_KEY
+                        || bad_pointer
                         || ptr + 4 + key_len + value_len > PAGE_SIZE
                     {
                         return Err(Error::CorruptPage(self.page_id()));
@@ -259,38 +285,64 @@ impl Page {
                             .try_into()
                             .map_err(|_| Error::CorruptPage(self.page_id()))?,
                     ) as usize;
-                    if key_len > MAX_KEY_LEN || ptr + 6 + key_len > PAGE_SIZE {
+                    if key_len > MAX_TREE_KEY || ptr + 6 + key_len > PAGE_SIZE {
                         return Err(Error::CorruptPage(self.page_id()));
                     }
                 }
-                PageKind::Meta | PageKind::Free => {
+                PageKind::Meta | PageKind::Free | PageKind::Overflow => {
                     return Err(Error::CorruptPage(self.page_id()));
                 }
             }
+        }
+        if self.kind() == PageKind::Overflow && self.extra() as usize > OVERFLOW_CAPACITY {
+            return Err(Error::CorruptPage(self.page_id()));
         }
         self.verify_checksum()?;
         Ok(())
     }
 
     // --- Leaf cells: [key_len:u16][val_len:u16][key][val] ---
+    //
+    // O bit 15 de `val_len` marca valor em páginas de overflow: a célula guarda
+    // então 8 bytes `[total:u32][primeira_página:u32]` em vez do valor.
 
+    /// Chave e campo de valor cru da célula `i` (ponteiro, se for overflow).
     pub fn leaf_cell(&self, i: usize) -> (&[u8], &[u8]) {
-        let ptr = self.slot_ptr(i) as usize;
-        let key_len = u16::from_le_bytes(self.data[ptr..ptr + 2].try_into().unwrap()) as usize;
-        let val_len = u16::from_le_bytes(self.data[ptr + 2..ptr + 4].try_into().unwrap()) as usize;
-        let key = &self.data[ptr + 4..ptr + 4 + key_len];
-        let val = &self.data[ptr + 4 + key_len..ptr + 4 + key_len + val_len];
-        (key, val)
+        let (k, v, _) = self.leaf_entry(i);
+        (k, v)
     }
 
-    pub fn insert_leaf_cell(&mut self, index: usize, key: &[u8], val: &[u8]) -> Result<()> {
-        self.insert_leaf_cell_unchecked(index, key, val)?;
+    /// Chave, campo de valor e se o valor está em páginas de overflow.
+    pub fn leaf_entry(&self, i: usize) -> (&[u8], &[u8], bool) {
+        let ptr = self.slot_ptr(i) as usize;
+        let key_len = u16::from_le_bytes(self.data[ptr..ptr + 2].try_into().unwrap()) as usize;
+        let raw = u16::from_le_bytes(self.data[ptr + 2..ptr + 4].try_into().unwrap());
+        let val_len = (raw & !VAL_OVERFLOW) as usize;
+        let key = &self.data[ptr + 4..ptr + 4 + key_len];
+        let val = &self.data[ptr + 4 + key_len..ptr + 4 + key_len + val_len];
+        (key, val, raw & VAL_OVERFLOW != 0)
+    }
+
+    pub fn insert_leaf_cell(
+        &mut self,
+        index: usize,
+        key: &[u8],
+        val: &[u8],
+        overflow: bool,
+    ) -> Result<()> {
+        self.insert_leaf_cell_unchecked(index, key, val, overflow)?;
         self.write_checksum();
         Ok(())
     }
 
     /// Insere sem recalcular o checksum (usado em reconstruções em lote).
-    fn insert_leaf_cell_unchecked(&mut self, index: usize, key: &[u8], val: &[u8]) -> Result<()> {
+    fn insert_leaf_cell_unchecked(
+        &mut self,
+        index: usize,
+        key: &[u8],
+        val: &[u8],
+        overflow: bool,
+    ) -> Result<()> {
         let need = 4 + key.len() + val.len() + 2; // cell + slot
         if self.free_space() < need {
             return Err(Error::PageFull);
@@ -298,8 +350,9 @@ impl Page {
         let cell_size = 4 + key.len() + val.len();
         let new_end = self.cell_end() as usize - cell_size;
         let ptr = new_end as u16;
+        let raw_len = val.len() as u16 | if overflow { VAL_OVERFLOW } else { 0 };
         self.data[new_end..new_end + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-        self.data[new_end + 2..new_end + 4].copy_from_slice(&(val.len() as u16).to_le_bytes());
+        self.data[new_end + 2..new_end + 4].copy_from_slice(&raw_len.to_le_bytes());
         self.data[new_end + 4..new_end + 4 + key.len()].copy_from_slice(key);
         self.data[new_end + 4 + key.len()..new_end + 4 + key.len() + val.len()]
             .copy_from_slice(val);
@@ -316,12 +369,6 @@ impl Page {
         Ok(())
     }
 
-    pub fn update_leaf_value(&mut self, index: usize, key: &[u8], val: &[u8]) -> Result<()> {
-        // Remove + reinsert (células não são móveis in-place se tamanho mudar).
-        self.remove_slot(index);
-        self.insert_leaf_cell(index, key, val)
-    }
-
     pub fn remove_slot(&mut self, index: usize) {
         let n = self.n_slots() as usize;
         debug_assert!(index < n);
@@ -333,17 +380,18 @@ impl Page {
         self.write_checksum();
     }
 
+    /// Busca binária: `Ok(slot)` se a chave existe, `Err(posição de inserção)`.
     pub fn find_leaf_slot(&self, key: &[u8]) -> std::result::Result<usize, usize> {
-        let n = self.n_slots() as usize;
-        for i in 0..n {
-            let (k, _) = self.leaf_cell(i);
-            match k.cmp(key) {
-                std::cmp::Ordering::Equal => return Ok(i),
-                std::cmp::Ordering::Greater => return Err(i),
-                std::cmp::Ordering::Less => {}
+        let (mut lo, mut hi) = (0usize, self.n_slots() as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.leaf_entry(mid).0.cmp(key) {
+                std::cmp::Ordering::Equal => return Ok(mid),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
             }
         }
-        Err(n)
+        Err(lo)
     }
 
     // --- Internal cells: [key_len:u16][child:u32][key] ---
@@ -392,37 +440,32 @@ impl Page {
     }
 
     /// Filho à direita da chave `i` (slot i). Filho à esquerda de tudo = leftmost_child.
+    /// Filho responsável por `key`: o da maior chave separadora `<= key`, ou
+    /// `leftmost_child` se todas forem maiores (busca binária).
     pub fn child_for_key(&self, key: &[u8]) -> u32 {
-        let n = self.n_slots() as usize;
-        if n == 0 {
-            return self.leftmost_child();
-        }
-        for i in 0..n {
-            let (k, _) = self.internal_cell(i);
-            if key < k {
-                if i == 0 {
-                    return self.leftmost_child();
-                }
-                let (_, prev_child) = self.internal_cell(i - 1);
-                return prev_child;
+        let (mut lo, mut hi) = (0usize, self.n_slots() as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.internal_cell(mid).0 <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        let (_, child) = self.internal_cell(n - 1);
-        child
+        if lo == 0 {
+            self.leftmost_child()
+        } else {
+            self.internal_cell(lo - 1).1
+        }
     }
 
     /// Reconstrói página limpa a partir de células folha (usado no split).
-    pub fn rebuild_leaf(
-        page_id: u32,
-        pairs: &[(Vec<u8>, Vec<u8>)],
-        right: u32,
-        lsn: u64,
-    ) -> Result<Self> {
+    pub fn rebuild_leaf(page_id: u32, entries: &[LeafEntry], right: u32, lsn: u64) -> Result<Self> {
         let mut p = Self::zeroed(page_id, PageKind::Leaf);
         p.set_right_sibling(right);
         p.set_lsn(lsn);
-        for (i, (k, v)) in pairs.iter().enumerate() {
-            p.insert_leaf_cell_unchecked(i, k, v)?;
+        for (i, e) in entries.iter().enumerate() {
+            p.insert_leaf_cell_unchecked(i, &e.key, &e.val, e.overflow)?;
         }
         p.write_checksum();
         Ok(p)
@@ -450,15 +493,11 @@ impl Page {
                 "compact_leaf em página que não é folha".into(),
             ));
         }
-        let mut pairs = Vec::with_capacity(self.n_slots() as usize);
-        for i in 0..self.n_slots() as usize {
-            let (k, v) = self.leaf_cell(i);
-            pairs.push((k.to_vec(), v.to_vec()));
-        }
+        let entries = self.leaf_entries();
         let right = self.right_sibling();
         let lsn = self.lsn();
         let id = self.page_id();
-        *self = Self::rebuild_leaf(id, &pairs, right, lsn)?;
+        *self = Self::rebuild_leaf(id, &entries, right, lsn)?;
         self.write_checksum();
         Ok(())
     }
@@ -480,6 +519,40 @@ impl Page {
         *self = Self::rebuild_internal(id, leftmost, &entries, lsn)?;
         self.write_checksum();
         Ok(())
+    }
+
+    /// Todas as células de uma folha, na ordem.
+    pub fn leaf_entries(&self) -> Vec<LeafEntry> {
+        (0..self.n_slots() as usize)
+            .map(|i| {
+                let (k, v, overflow) = self.leaf_entry(i);
+                LeafEntry {
+                    key: k.to_vec(),
+                    val: v.to_vec(),
+                    overflow,
+                }
+            })
+            .collect()
+    }
+
+    // --- Overflow: `right_sibling` = próxima página, `extra` = bytes usados ---
+
+    /// Página de overflow com um pedaço do valor.
+    pub fn overflow(page_id: u32, next: u32, chunk: &[u8], lsn: u64) -> Self {
+        debug_assert!(chunk.len() <= OVERFLOW_CAPACITY);
+        let mut p = Self::zeroed(page_id, PageKind::Overflow);
+        p.set_right_sibling(next);
+        p.set_extra(chunk.len() as u32);
+        p.set_lsn(lsn);
+        p.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
+        p.write_checksum();
+        p
+    }
+
+    /// Bytes do valor guardados nesta página de overflow.
+    pub fn overflow_data(&self) -> &[u8] {
+        let used = (self.extra() as usize).min(OVERFLOW_CAPACITY);
+        &self.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + used]
     }
 }
 
@@ -536,6 +609,9 @@ pub struct MetaInfo {
 pub const META_FLAG_VALUE_INDEX: u32 = 1;
 /// Valores da árvore primária gravados com [`crate::codec`] (bancos 0.5+).
 pub const META_FLAG_COMPRESSED_VALUES: u32 = 2;
+/// Índice por valor no formato por hash (bancos 0.6+); sem a flag, o índice
+/// antigo é reconstruído na abertura.
+pub const META_FLAG_INDEX_V2: u32 = 4;
 
 impl MetaInfo {
     pub const META_PAGE_ID: u32 = 0;
@@ -606,7 +682,7 @@ impl MetaInfo {
     /// Meta de um arquivo novo: já nasce com valores comprimidos.
     pub fn fresh_file() -> Self {
         Self {
-            flags: META_FLAG_COMPRESSED_VALUES,
+            flags: META_FLAG_COMPRESSED_VALUES | META_FLAG_INDEX_V2,
             ..Self::fresh()
         }
     }
@@ -620,7 +696,7 @@ mod tests {
     fn crc16_matches_reference_vector() {
         assert_eq!(crc16(b"123456789"), 0x29B1);
         let mut p = Page::zeroed(3, PageKind::Leaf);
-        p.insert_leaf_cell(0, b"k", b"v").unwrap();
+        p.insert_leaf_cell(0, b"k", b"v", false).unwrap();
         let mut copy = p.data;
         copy[30] = 0;
         copy[31] = 0;
@@ -630,9 +706,9 @@ mod tests {
     #[test]
     fn leaf_insert_and_find() {
         let mut p = Page::zeroed(1, PageKind::Leaf);
-        p.insert_leaf_cell(0, b"a", b"1").unwrap();
-        p.insert_leaf_cell(1, b"c", b"3").unwrap();
-        p.insert_leaf_cell(1, b"b", b"2").unwrap();
+        p.insert_leaf_cell(0, b"a", b"1", false).unwrap();
+        p.insert_leaf_cell(1, b"c", b"3", false).unwrap();
+        p.insert_leaf_cell(1, b"b", b"2", false).unwrap();
         assert_eq!(p.n_slots(), 3);
         let (k, v) = p.leaf_cell(1);
         assert_eq!(k, b"b");
@@ -644,7 +720,7 @@ mod tests {
     #[test]
     fn rejects_valid_checksum_with_invalid_cell_bounds() {
         let mut p = Page::zeroed(1, PageKind::Leaf);
-        p.insert_leaf_cell(0, b"a", b"1").unwrap();
+        p.insert_leaf_cell(0, b"a", b"1", false).unwrap();
         p.set_slot_ptr(0, PAGE_SIZE as u16 - 1);
         p.write_checksum();
         assert!(p.validate_header().is_err());

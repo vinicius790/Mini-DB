@@ -101,7 +101,7 @@ fn garbage_wal_tail_is_ignored_on_open() {
     std::fs::write(Db::wal_path(&dir), &wal).unwrap();
     let (_, records) = Wal::read_all(Db::wal_path(&dir)).unwrap();
     assert!(!records.is_empty());
-    let mut db = Db::open(&dir).unwrap();
+    let db = Db::open(&dir).unwrap();
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_ref()));
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -120,5 +120,71 @@ fn relational_parser_and_codec_never_panic() {
             blob
         );
         let _ = mini_db::codec::decode_value(&blob);
+    }
+}
+
+#[test]
+fn regex_compiler_and_matcher_never_panic() {
+    use mini_db::rel::regex::Regex;
+    let mut rng = Rng(29);
+    let alphabet: &[u8] = b"ab01.*+?|()[]{}^$\\:-,dws alphnum";
+    for _ in 0..ITERS {
+        let raw = rng.bytes(24, alphabet);
+        let pattern = String::from_utf8_lossy(&raw);
+        if let Ok(re) = Regex::new(&pattern, "") {
+            let _ = re.is_match("ab01 ab0");
+        }
+    }
+    // Classe POSIX sem nome já causou pânico (fatia invertida).
+    assert!(Regex::new("[[:]", "").is_err());
+    assert!(Regex::new("[[:alpha:]]+", "").unwrap().is_match("abc"));
+    assert!(!Regex::new("^[[:digit:]]+$", "").unwrap().is_match("abc"));
+    // Texto no tamanho máximo: o casador usa uma pilha de retrocesso no heap, então nem
+    // `.*` nem um grupo repetido gastam pilha nativa por caractere ou por volta.
+    let long = "a".repeat(50_000);
+    assert!(Regex::new("^.*$", "").unwrap().is_match(&long));
+    assert!(Regex::new("(a)*$", "").unwrap().is_match(&long));
+    assert!(!Regex::new("^((a|b))+c", "").unwrap().is_match(&long));
+    // Orçamento da varredura: uma busca quadrática legítima (`[a-z]+` recua em cada uma
+    // das 5 mil posições, uns 2,5e7 passos) ainda casa; as patológicas desistem logo.
+    let letters = format!("{} foo1", "a".repeat(5_000));
+    assert!(Regex::new("[a-z]+\\d", "").unwrap().is_match(&letters));
+    // `(a|aa)+$` casa sem recuar; em `(a*)*b` (sem 'b' no texto) o orçamento de passos
+    // corta a busca exponencial.
+    assert!(Regex::new("(a|aa)+$", "").unwrap().is_match(&long));
+    assert!(!Regex::new("(a*)*b", "").unwrap().is_match(&long));
+}
+
+#[test]
+fn regex_has_no_practical_depth_limit() {
+    use mini_db::rel::regex::Regex;
+    let re = |p: &str| Regex::new(p, "").unwrap();
+    // Grupo repetido milhares de vezes e padrão com milhares de átomos em sequência.
+    let ab = "ab".repeat(10_000);
+    assert!(re("(ab)*c").is_match(&format!("{ab}c")));
+    assert!(re("^(a|b)+$").is_match(&ab.repeat(2)));
+    let literal = "ab".repeat(1_000);
+    let exact = re(&format!("^{literal}$"));
+    assert!(exact.is_match(&literal));
+    assert!(!exact.is_match(&format!("{literal}x")));
+    // Capturas e preguiça seguem a mesma ordem de tentativas de sempre.
+    let chars: Vec<char> = "ab".chars().collect();
+    let (_, _, caps) = re("(a)(b)?").find_at(&chars, 0).unwrap();
+    assert_eq!(caps, vec![Some((0, 2)), Some((0, 1)), Some((1, 2))]);
+    let chars: Vec<char> = "aaab".chars().collect();
+    let (start, end, _) = re("a+?b").find_at(&chars, 0).unwrap();
+    assert_eq!((start, end), (0, 4));
+}
+
+#[test]
+fn pem_and_certificate_decoders_never_panic() {
+    let mut rng = Rng(31);
+    for _ in 0..ITERS {
+        let raw = rng.bytes(96, &[]);
+        let _ = mini_db::x509::Cert::parse(&raw);
+        let pem = rng.bytes(96, b"-BEGINDCRTFAK \nabc+/=");
+        let text = String::from_utf8_lossy(&pem);
+        let _ = mini_db::x509::pem_all(&text, "CERTIFICATE");
+        let _ = mini_db::pubkey::PrivateKey::from_pem(&text);
     }
 }

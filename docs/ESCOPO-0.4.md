@@ -1,5 +1,9 @@
 # Escopo da versão 0.4
 
+> Documento histórico. Os itens listados como fora de escopo (MVCC, JOIN, autenticação,
+> TLS, replicação contínua, compressão) foram implementados depois; veja o
+> [CHANGELOG](../CHANGELOG.md) e o [README](../README.md).
+
 A 0.4 amplia o motor e a estratégia de qualidade mantendo o núcleo sem
 dependências e o formato em disco compatível com a 0.3.
 
