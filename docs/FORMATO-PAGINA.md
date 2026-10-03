@@ -35,7 +35,8 @@ next_txn_id u64 | flags u32 | ttl_root u32   (0.4+; zero em arquivos 0.3)
 valor, `[len u16][valor][chave]` → chave) e `ttl_root` (expiração, chave →
 `expires_at` u64 big-endian em ms). As três usam o mesmo formato de página.
 
-Nota: em bancos cifrados no formato v2 o cabeçalho é cifrado e autenticado (ver
+Nota: em bancos cifrados (formato v3; o v2 é migrado na abertura) o cabeçalho é cifrado
+e autenticado e o nonce de cada página fica no mapa `data.mdb.pages` (ver
 `docs/RECOVERY.md`); o que segue descreve o formato em claro e o v1.
 
 Checksum: CRC16-CCITT-FALSE (poly 0x1021, init 0xFFFF; vetor `"123456789"` →

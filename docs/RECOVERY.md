@@ -43,14 +43,25 @@ publicação por rename depende do sistema de arquivos.
 
 ## Integridade com criptografia em repouso
 
-Em bancos cifrados criados a partir desta versão (`data.mdb.key` de versão 2), cada página
-de `data.mdb`, do journal e do spill leva uma etiqueta Poly1305 de 80 bits (ChaCha20-Poly1305,
-nonce `id ‖ 8 bytes aleatórios`, AAD com a posição). A etiqueta substitui o magic, o id, o
-LSN e o CRC16 do cabeçalho de 32 bytes, então a página continua com 4096 bytes, sem arquivo
-lateral e sem mexer no journal: a etiqueta viaja com a página e a recuperação do journal
-continua uma cópia de bytes. Alterar um byte, mover uma página de lugar ou adulterar o
-cabeçalho dá `CorruptPage` na leitura. Bancos de chave versão 1 mantêm o formato antigo
-(CRC16 em claro, que quem tem o arquivo refaz ou zera) e migram com `encrypt`/`rekey`.
+Em bancos cifrados criados a partir desta versão (`data.mdb.key` de versão 3), cada página
+de `data.mdb`, do journal e do spill é um ChaCha20-Poly1305 com a etiqueta inteira de 128
+bits e AAD com a posição. A imagem é `etiqueta(16) ‖ campos do cabeçalho(14) ‖ 2 bytes ‖
+corpo`, cifrada: a página continua com 4096 bytes. O nonce de cada página **não** fica
+nela: fica no mapa de páginas `data.mdb.pages`, um arquivo com o nonce atual de cada
+página e um HMAC-SHA256 (subchave do banco) sobre tudo. Cada checkpoint sela as páginas
+alteradas com nonces novos; o journal leva as imagens e o mapa novo, e o mapa é publicado
+por temporário + fsync + rename depois das páginas. O mapa novo guarda o MAC do anterior:
+na abertura um journal só é reaplicado se o mapa dele descende do mapa instalado (ou já é
+ele), então um journal antigo deixado no diretório é descartado sem tocar em nada. Trocas
+do arquivo de dados (`VACUUM`, `encrypt`/`rekey`/`decrypt`, migração) publicam o mapa
+novo como `data.mdb.pages.next` e o instalam depois do rename do arquivo; uma queda entre
+os dois é resolvida na abertura (vale o mapa com que a página 0 abre).
+
+O que dá `CorruptPage` na leitura: byte alterado, página movida de lugar, cabeçalho
+adulterado, **versão antiga e válida de uma página** (*replay*: o mapa já aponta para o
+nonce novo), mapa antigo, adulterado ou apagado, e arquivo de dados truncado (o mapa
+conhece páginas que sumiram).
+
 Os frames do WAL desses bancos também são autenticados (ChaCha20-Poly1305 encadeado
 pelo LSN do frame anterior; formato em `docs/WAL.md`): frame alterado, removido,
 repetido ou fora de ordem dá `CorruptWal`, mesmo no fim do arquivo quando o CRC confere.
@@ -58,15 +69,22 @@ Um frame truncado ou com CRC ruim no fim continua sendo tratado como escrita
 interrompida, então quem altera o arquivo pode cortar as últimas transações do WAL, mas
 não mudar as que ficam.
 
-Não há proteção contra *replay* (devolver uma versão antiga e válida da mesma página, ou
-o banco inteiro numa cópia anterior). Fechar isso exigiria guardar a versão atual de
-cada página num lugar autenticado: um contador de geração no AAD obrigaria a regravar
-todas as páginas a cada checkpoint, e uma tabela de etiquetas ou árvore de Merkle muda o
-formato, o journal, o spill, o `VACUUM` e o `convert`. Mesmo assim a volta do diretório
-inteiro a uma cópia anterior coerente só seria detectada com um contador fora do disco.
-O modelo coberto é o de quem lê ou altera os arquivos sem a senha: não lê os dados e não
-forja nem edita páginas ou registros; voltar o banco (ou uma página) a um estado antigo
-que ele mesmo gravou fica fora.
+Bancos de formatos anteriores (chave v1: CRC16 em claro; chave v2: etiqueta de 80 bits,
+sem mapa) são migrados para v3 automaticamente na primeira abertura com a senha, com a
+**mesma chave** (só o byte de versão do `data.mdb.key` muda): réplicas, WAL arquivado e
+backups continuam valendo (os segmentos arquivados de um banco v1 são regravados com
+frames autenticados). A migração reescreve `data.mdb` num temporário (precisa do espaço
+de uma cópia) e é desfeita ou concluída por `recover_convert` se cair no meio; se falhar
+(disco cheio, diretório só de leitura), o banco abre no formato antigo e a próxima
+abertura tenta de novo. O primeiro backup depois de uma troca de chave ou de formato é
+completo (a base antiga não abriria os segmentos novos).
+
+O que continua fora: voltar o **diretório inteiro** a uma cópia anterior coerente (todas
+as páginas, o mapa e o WAL juntos, como restaurar um backup) não é detectável sem um
+contador guardado fora do disco.
+O modelo coberto é o de quem lê ou altera os arquivos sem a senha: não lê os dados, não
+forja nem edita páginas ou registros e não volta páginas isoladas no tempo; voltar o
+banco inteiro a um estado antigo que ele mesmo gravou fica fora.
 
 ## VACUUM
 

@@ -1,4 +1,4 @@
-//! `COPY ... FROM STDIN` e `COPY ... TO STDOUT` (formato texto) no protocolo PostgreSQL.
+//! `COPY ... FROM STDIN` e `COPY ... TO STDOUT` (formatos texto e CSV) no protocolo PostgreSQL.
 use mini_db::config::NetOptions;
 use mini_db::mvcc::SharedDb;
 use mini_db::Db;
@@ -165,6 +165,19 @@ fn count(c: &mut Pg) -> String {
     rows(&m)[0][0].clone().unwrap()
 }
 
+/// `COPY ... FROM STDIN` completo: cada pedaço vai num `CopyData`.
+fn copy_in(c: &mut Pg, sql: &str, parts: &[&str]) -> Msgs {
+    let mut q = sql.as_bytes().to_vec();
+    q.push(0);
+    c.msg(b'Q', &q);
+    assert_eq!(c.read().0, b'G', "{sql}");
+    for p in parts {
+        c.msg(b'd', p.as_bytes());
+    }
+    c.msg(b'c', &[]);
+    c.until_ready()
+}
+
 #[test]
 fn copy_from_stdin_and_to_stdout_text_format() {
     let mut c = server("texto");
@@ -270,7 +283,7 @@ fn copy_errors_keep_the_connection_usable() {
     for sql in [
         "COPY copiar (zzz) FROM STDIN",
         "COPY copiar FROM '/tmp/x'",
-        "COPY copiar FROM STDIN WITH CSV",
+        "COPY copiar FROM STDIN WITH (FORMAT binary)",
         "COPY (SELECT 1) FROM STDIN",
         "COPY copiar",
     ] {
@@ -281,4 +294,101 @@ fn copy_errors_keep_the_connection_usable() {
     c.msg(b'd', b"lixo");
     let m = c.query("SELECT 1");
     assert_eq!(rows(&m), [vec![s("1")]]);
+}
+
+#[test]
+fn copy_csv_round_trip_with_header() {
+    let mut c = server("csv");
+    // HEADER descarta a 1ª linha; as aspas protegem vírgula, aspa dobrada e quebra de linha
+    // (aqui partida entre dois CopyData); vazio sem aspas é NULL e "" é texto vazio.
+    let sql = "COPY copiar FROM STDIN WITH (FORMAT csv, HEADER true)";
+    let dados = [
+        "id,nome,nota\n1,\"Silva, Ana\",9.5\n2,,7\n3,\"diz \"\"oi\"\"\n",
+        "tchau\",\n4,\"\",1\n\\.\n",
+    ];
+    let m = copy_in(&mut c, sql, &dados);
+    assert_eq!(kinds(&m), "CZ", "{:?}", errors(&m));
+    assert_eq!(tags(&m), ["COPY 4"]);
+    let m = c.query("SELECT id, nome, nota FROM copiar ORDER BY id");
+    assert_eq!(
+        rows(&m),
+        [
+            vec![s("1"), s("Silva, Ana"), s("9.5")],
+            vec![s("2"), None, s("7")],
+            vec![s("3"), s("diz \"oi\"\ntchau"), None],
+            vec![s("4"), s(""), s("1")],
+        ]
+    );
+
+    // TO STDOUT com HEADER: formato geral texto (0) e aspas só onde precisa.
+    let m = c.query("COPY copiar TO STDOUT WITH (FORMAT csv, HEADER)");
+    assert_eq!(kinds(&m), "HdddddcCZ");
+    assert_eq!(m[0].1, [0, 0, 3, 0, 0, 0, 0, 0, 0]);
+    let saida = copy_lines(&m);
+    assert_eq!(
+        saida,
+        [
+            "id,nome,nota\n",
+            "1,\"Silva, Ana\",9.5\n",
+            "2,,7\n",
+            "3,\"diz \"\"oi\"\"\ntchau\",\n",
+            "4,\"\",1\n",
+        ]
+    );
+    assert_eq!(tags(&m), ["COPY 4"]);
+
+    // Ida e volta pela forma antiga (`CSV HEADER`): a saída volta igual.
+    c.query("DELETE FROM copiar");
+    let tudo = saida.concat();
+    let sql = "COPY copiar FROM STDIN CSV HEADER";
+    let m = copy_in(&mut c, sql, &[tudo.as_str()]);
+    assert_eq!(tags(&m), ["COPY 4"], "{:?}", errors(&m));
+    let m = c.query("COPY copiar TO STDOUT WITH CSV HEADER");
+    assert_eq!(copy_lines(&m), saida);
+}
+
+#[test]
+fn copy_csv_delimiter_and_null() {
+    let mut c = server("csv-opcoes");
+    // DELIMITER ';' e NULL próprio: a vírgula é texto comum e "nulo" entre aspas é texto.
+    let sql = "COPY copiar (id, nome) FROM STDIN (FORMAT csv, DELIMITER ';', NULL 'nulo')";
+    let dados = ["1;a,b\n2;\"x;y\"\n3;nulo\n4;\"nulo\"\n"];
+    let m = copy_in(&mut c, sql, &dados);
+    assert_eq!(tags(&m), ["COPY 4"], "{:?}", errors(&m));
+    let m = c.query("SELECT id FROM copiar WHERE nome IS NULL");
+    assert_eq!(rows(&m), [vec![s("3")]]);
+    let sql = "COPY copiar (id, nome) TO STDOUT (FORMAT csv, DELIMITER ';', NULL 'nulo')";
+    let m = c.query(sql);
+    assert_eq!(
+        copy_lines(&m),
+        ["1;a,b\n", "2;\"x;y\"\n", "3;nulo\n", "4;\"nulo\"\n"]
+    );
+}
+
+#[test]
+fn copy_csv_errors_write_nothing() {
+    let mut c = server("csv-erros");
+    // Opções inválidas: recusadas antes do CopyInResponse.
+    for sql in [
+        "COPY copiar FROM STDIN WITH (FORMAT csv, DELIMITER ';;')",
+        "COPY copiar FROM STDIN WITH (FORMAT csv, QUOTE ',')",
+        "COPY copiar FROM STDIN WITH (FORMAT csv, NULL ',')",
+        "COPY copiar TO STDOUT WITH (FORMAT csv, FOO 'x')",
+        "COPY copiar TO STDOUT WITH (FORMAT text, HEADER)",
+    ] {
+        let m = c.query(sql);
+        assert_eq!(kinds(&m), "EZ", "{sql}: {m:?}");
+    }
+
+    // Coluna a mais na linha 3 (o cabeçalho é a 1): erro com o número da linha.
+    let sql = "COPY copiar FROM STDIN CSV HEADER";
+    let m = copy_in(&mut c, sql, &["id,nome,nota\n1,a,1\n2,b,2,9\n"]);
+    let e = errors(&m);
+    assert!(e.len() == 1 && e[0].contains("linha 3"), "{e:?}");
+    // Aspas sem fechamento.
+    let sql = "COPY copiar FROM STDIN CSV";
+    let m = copy_in(&mut c, sql, &["1,\"aberta,1\n"]);
+    let e = errors(&m);
+    assert!(e.len() == 1 && e[0].contains("aspas"), "{e:?}");
+    assert_eq!(count(&mut c), "0");
 }

@@ -18,7 +18,7 @@ meio do log e dá `CorruptWal`. Com criptografia em repouso o CRC cobre o texto
 cifrado, e o formato do payload vem da versão do `data.mdb.key` (nunca do conteúdo do
 arquivo):
 
-- **v2 (bancos cifrados novos)**: `nonce(12) ‖ ChaCha20-Poly1305(payload) ‖ etiqueta(16)`,
+- **v2 e v3 (bancos cifrados; chave de versão 2 ou 3)**: `nonce(12) ‖ ChaCha20-Poly1305(payload) ‖ etiqueta(16)`,
   com uma subchave só do WAL (HMAC da chave do banco) e nonce aleatório: um LSN pode
   voltar a ser usado com outro conteúdo (cauda descartada no recovery, restauração até
   um ponto), então o nonce não deriva dele. O AAD é `"minidb wal v2" ‖ lsn do frame
@@ -31,10 +31,11 @@ arquivo):
   quem altera o arquivo consegue **cortar o fim do log** (perder as últimas
   transações), mas não alterar, reordenar ou remover o que fica antes. Trocar o
   arquivo inteiro por outro WAL válido do mesmo banco (cópia antiga, segmento
-  arquivado) também não é detectado: é o mesmo limite do *replay* de páginas
-  (`docs/RECOVERY.md`).
+  arquivado) também não é detectado: equivale a cortar o fim do log ou a voltar o
+  diretório inteiro a uma cópia anterior (`docs/RECOVERY.md`).
 - **v1 (legado)**: `sal(4) ‖ ChaCha20(payload)` (nonce = sal ‖ lsn), sem etiqueta: só o
-  CRC, que quem tem o arquivo refaz.
+  CRC, que quem tem o arquivo refaz. Bancos v1 são migrados na primeira abertura com a
+  senha, e os segmentos arquivados são regravados no formato autenticado.
 
 Cada arquivo (o `wal.log` atual e cada segmento de `wal-archive/`) começa uma cadeia
 nova, então é sempre lido inteiro, do início.

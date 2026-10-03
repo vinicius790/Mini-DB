@@ -2,6 +2,27 @@
 
 ## Não lançado (correções pós-1.3.0)
 
+Criptografia em repouso
+- Formato de página v3 (`data.mdb.key` de versão 3) em bancos cifrados: etiqueta
+  Poly1305 inteira de 128 bits (era truncada em 80) e nonce de cada página guardado num
+  mapa autenticado, `data.mdb.pages` (HMAC-SHA256, encadeado ao mapa anterior). Devolver
+  uma versão antiga e válida de uma página (*replay*), o mapa antigo ou um journal antigo
+  passa a ser detectado; arquivo de dados truncado também. O mapa vai no journal e nas
+  trocas de arquivo (`VACUUM`, `encrypt`/`rekey`/`decrypt`), em backups e em
+  `ship_snapshot`.
+- Bancos cifrados v1 e v2 são migrados para v3 automaticamente na primeira abertura com
+  a senha, com a mesma chave: o WAL arquivado continua valendo (num banco v1, os
+  segmentos são regravados com frames autenticados). Se a migração falhar, o banco abre
+  no formato antigo e a próxima abertura tenta de novo.
+- Backup incremental: se a chave (ou o formato dela) mudou desde a base, o backup
+  recomeça completo no mesmo destino; antes, depois de um `rekey`, os segmentos novos
+  iam para uma base que não os abria.
+
+Protocolo PostgreSQL
+- `COPY ... FROM STDIN` / `TO STDOUT` em CSV: `WITH (FORMAT csv, HEADER, DELIMITER,
+  NULL, QUOTE, ESCAPE)` e a forma antiga `WITH CSV HEADER`, com as regras de aspas,
+  NULL e `\.` do PostgreSQL.
+
 Replicação
 - Modo cluster opcional com failover automático: eleição de líder no estilo Raft
   (`src/raft.rs`, máquina de estados pura e determinística) sobre a replicação lógica

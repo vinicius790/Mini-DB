@@ -602,6 +602,24 @@ fn only_zeros_from(file: &mut File, from: u64) -> Result<bool> {
     }
 }
 
+/// Regrava em `dest` (com fsync) o segmento `src`, lido com a cifra `from`, no
+/// formato de frame da cifra `to`: mesmos registros, mesmos LSNs. Usado na
+/// migração de bancos cifrados v1 para frames autenticados.
+pub(crate) fn rewrite_segment(src: &Path, dest: &Path, from: &Cipher, to: &Cipher) -> Result<()> {
+    let (_, records) = Wal::read_all_with(src, Some(from))?;
+    let mut out = WAL_MAGIC.to_vec();
+    out.extend_from_slice(&WAL_VERSION.to_le_bytes());
+    let mut prev = 0;
+    for record in &records {
+        out.extend_from_slice(&record.encode_frame_after(Some(to), prev));
+        prev = record.lsn();
+    }
+    let mut file = File::create(dest)?;
+    file.write_all(&out)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 /// Simula crash truncando o arquivo WAL no meio do último frame (teste).
 pub fn truncate_file_at(path: impl AsRef<Path>, new_len: u64) -> Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;

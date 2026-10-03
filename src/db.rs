@@ -308,13 +308,39 @@ impl Db {
     /// Abre com criptografia em repouso: `passphrase` cria a chave num banco
     /// novo e é exigida (e conferida) nas aberturas seguintes. Ver
     /// [`crate::encryption`].
+    ///
+    /// Um banco cifrado em formato antigo (páginas v1/v2) é migrado para v3 nesta
+    /// abertura, com a mesma chave ([`crate::encryption::upgrade`]). Se a migração
+    /// falhar (disco cheio, diretório só de leitura), o banco abre no formato antigo
+    /// e a próxima abertura tenta de novo.
     pub fn open_encrypted(
         dir: impl AsRef<Path>,
         pool_capacity: usize,
         sync_wal: bool,
         passphrase: Option<&str>,
     ) -> Result<Self> {
-        let dir = dir.as_ref().to_path_buf();
+        Self::open_impl(dir.as_ref(), pool_capacity, sync_wal, passphrase, true)
+    }
+
+    /// Como [`Db::open_encrypted`], sem migrar o formato das páginas (usado pela
+    /// própria conversão).
+    pub(crate) fn open_without_upgrade(
+        dir: impl AsRef<Path>,
+        pool_capacity: usize,
+        sync_wal: bool,
+        passphrase: Option<&str>,
+    ) -> Result<Self> {
+        Self::open_impl(dir.as_ref(), pool_capacity, sync_wal, passphrase, false)
+    }
+
+    fn open_impl(
+        dir: &Path,
+        pool_capacity: usize,
+        sync_wal: bool,
+        passphrase: Option<&str>,
+        upgrade: bool,
+    ) -> Result<Self> {
+        let dir = dir.to_path_buf();
         fs::create_dir_all(&dir)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -325,7 +351,7 @@ impl Db {
         lock.try_lock()
             .map_err(|e| Error::Other(format!("banco {} já está em uso: {e}", dir.display())))?;
         // Sobra de um VACUUM interrompido antes do rename: o original vale.
-        for leftover in ["", ".spill", ".journal"] {
+        for leftover in ["", ".spill", ".journal", ".pages"] {
             let _ = fs::remove_file(dir.join(format!("{VACUUM_FILE}{leftover}")));
         }
         // `encrypt`/`decrypt`/`rekey` interrompido: volta ao original ou conclui.
@@ -333,7 +359,17 @@ impl Db {
         let wal_path = Self::wal_path(&dir);
         let has_data = fs::metadata(Self::data_path(&dir)).is_ok_and(|m| m.len() > 0)
             || fs::metadata(&wal_path).is_ok_and(|m| m.len() > 8);
-        let cipher = crate::encryption::open_key(&dir, passphrase, has_data)?.map(Arc::new);
+        let cipher = crate::encryption::open_key(&dir, passphrase, has_data)?;
+        if let (true, Some(c), Some(pass)) = (upgrade, &cipher, passphrase) {
+            if !c.uses_page_map() {
+                // Banco cifrado em formato antigo: migra (a conversão toma o lock) e
+                // reabre. Uma falha deixa o banco como estava (`recover_convert`).
+                drop(lock);
+                let _ = crate::encryption::upgrade(&dir, pass);
+                return Self::open_impl(&dir, pool_capacity, sync_wal, passphrase, false);
+            }
+        }
+        let cipher = cipher.map(Arc::new);
         let mut pool = BufferPool::open_with(Self::data_path(&dir), pool_capacity, cipher.clone())?;
         let mut meta = Self::load_or_init_meta(&mut pool)?;
         let (wal_next, records) = Wal::read_all_with(&wal_path, cipher.as_deref())?;
@@ -1368,9 +1404,7 @@ impl Db {
             &mut self.pool,
             BufferPool::open_with(&vpath, capacity, cipher.clone())?,
         ));
-        fs::rename(&vpath, &data)?;
-        #[cfg(unix)]
-        File::open(&self.dir)?.sync_all()?;
+        crate::buffer::replace_data_file(&vpath, &data)?;
         self.pool = BufferPool::open_with(&data, capacity, cipher)?;
         let _ = fs::remove_file(self.dir.join(format!("{VACUUM_FILE}.spill")));
         self.meta = vmeta;
