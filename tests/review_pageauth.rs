@@ -247,7 +247,9 @@ fn replaying_an_old_version_of_a_page_or_of_the_map_is_detected() {
     let mut detected = 0;
     for &page in &changed {
         let copy = copy_db(&dir);
-        patch(&copy, |b| b[page_range(page)].copy_from_slice(&old[page_range(page)]));
+        patch(&copy, |b| {
+            b[page_range(page)].copy_from_slice(&old[page_range(page)])
+        });
         match read_all(&copy) {
             Err(Error::CorruptPage(_)) => detected += 1,
             // Página fora da árvore (livre): a leitura não passa por ela.

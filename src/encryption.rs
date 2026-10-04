@@ -680,7 +680,10 @@ mod tests {
         assert!(v2.is_authenticated() && !v2.uses_page_map());
         let mut p2 = plain.clone();
         v2.seal_page(&mut p2);
-        assert_eq!(&v2.open_page(7, &p2.data, None).unwrap().data[32..], &plain.data[32..]);
+        assert_eq!(
+            &v2.open_page(7, &p2.data, None).unwrap().data[32..],
+            &plain.data[32..]
+        );
         assert!(v2.open_page(8, &p2.data, None).is_err());
         // Formato legado (v1): continua abrindo, só com checksum.
         let old = Cipher::from_passphrase("senha", b"sal", 10).legacy();

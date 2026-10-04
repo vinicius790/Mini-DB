@@ -596,7 +596,8 @@ impl BufferPool {
             let mut crc = crc32_update(0xFFFF_FFFF, &head);
             w.write_all(&head)?;
             for (id, nonce) in &nonces {
-                let page = sealed(&inner.image(*id)?, cipher.as_deref(), nonce);
+                let image = inner.image(*id)?;
+                let page = sealed(&image, cipher.as_deref(), nonce);
                 let id_bytes = id.to_le_bytes();
                 crc = crc32_update(crc, &id_bytes);
                 crc = crc32_update(crc, &page.data);
@@ -618,7 +619,8 @@ impl BufferPool {
         sync_dir(&path)?;
         // 2. Escrita no lugar (e o mapa novo).
         for (id, nonce) in &nonces {
-            let page = sealed(&inner.image(*id)?, cipher.as_deref(), nonce);
+            let image = inner.image(*id)?;
+            let page = sealed(&image, cipher.as_deref(), nonce);
             inner
                 .file
                 .seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
