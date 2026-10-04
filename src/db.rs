@@ -623,10 +623,10 @@ impl Db {
     }
 
     /// Registra `ops` no WAL (em um frame BEGIN/COMMIT quando há mais de uma
-    /// ou quando vêm de uma transação) e publica no feed de replicação. Não toca
-    /// as árvores: só precisa de `&self`, então leitores continuam durante o
-    /// `fsync`. Devolve o LSN do commit. Chamadores serializam os escritores e,
-    /// antes de aplicar, esperam as réplicas (`repl.wait_for_replicas`).
+    /// ou quando vêm de uma transação), publica no feed de replicação e, com
+    /// replicação semi-síncrona, espera as confirmações. Não toca as árvores:
+    /// só precisa de `&self`, então leitores continuam durante o `fsync`.
+    /// Devolve o LSN do commit. Chamadores serializam os escritores.
     pub(crate) fn log(&self, ops: &[Op], txn_id: Option<u64>) -> Result<u64> {
         self.ensure_open()?;
         let framed = match txn_id {
@@ -680,6 +680,7 @@ impl Db {
             self.repl.publish(lsn, ops);
             lsn
         };
+        self.repl.wait_for_replicas(lsn);
         Ok(lsn)
     }
 
@@ -711,11 +712,7 @@ impl Db {
         }
         self.maybe_checkpoint()?;
         let lsn = self.log(ops, txn_id)?;
-        // Espera antes de aplicar (só fica visível depois de confirmado). Sem a
-        // confirmação o lote já está no WAL: aplica e devolve o erro depois.
-        let replicated = self.repl.wait_for_replicas(lsn);
-        self.apply_logged(ops, lsn)?;
-        replicated
+        self.apply_logged(ops, lsn)
     }
 
     /// Checkpoint automático quando o WAL passa do limite (antes de escrever,
