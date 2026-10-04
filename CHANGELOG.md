@@ -17,6 +17,9 @@ Criptografia em repouso
 - Backup incremental: se a chave (ou o formato dela) mudou desde a base, o backup
   recomeça completo no mesmo destino; antes, depois de um `rekey`, os segmentos novos
   iam para uma base que não os abria.
+- Checkpoint com arquivamento do WAL ligado e WAL vazio (ex.: `backup` logo depois de
+  abrir um banco fechado limpo) falhava com "arquivo não encontrado" porque
+  `wal-archive/` ainda não existia.
 
 Protocolo PostgreSQL
 - `COPY ... FROM STDIN` / `TO STDOUT` em CSV: `WITH (FORMAT csv, HEADER, DELIMITER,

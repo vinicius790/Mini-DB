@@ -623,10 +623,10 @@ impl Db {
     }
 
     /// Registra `ops` no WAL (em um frame BEGIN/COMMIT quando há mais de uma
-    /// ou quando vêm de uma transação), publica no feed de replicação e, com
-    /// replicação semi-síncrona, espera as confirmações. Não toca as árvores:
-    /// só precisa de `&self`, então leitores continuam durante o `fsync`.
-    /// Devolve o LSN do commit. Chamadores serializam os escritores.
+    /// ou quando vêm de uma transação) e publica no feed de replicação. Não toca
+    /// as árvores: só precisa de `&self`, então leitores continuam durante o
+    /// `fsync`. Devolve o LSN do commit. Chamadores serializam os escritores e,
+    /// antes de aplicar, esperam as réplicas (`repl.wait_for_replicas`).
     pub(crate) fn log(&self, ops: &[Op], txn_id: Option<u64>) -> Result<u64> {
         self.ensure_open()?;
         let framed = match txn_id {
@@ -680,7 +680,6 @@ impl Db {
             self.repl.publish(lsn, ops);
             lsn
         };
-        self.repl.wait_for_replicas(lsn);
         Ok(lsn)
     }
 
@@ -712,7 +711,11 @@ impl Db {
         }
         self.maybe_checkpoint()?;
         let lsn = self.log(ops, txn_id)?;
-        self.apply_logged(ops, lsn)
+        // Espera antes de aplicar (só fica visível depois de confirmado). Sem a
+        // confirmação o lote já está no WAL: aplica e devolve o erro depois.
+        let replicated = self.repl.wait_for_replicas(lsn);
+        self.apply_logged(ops, lsn)?;
+        replicated
     }
 
     /// Checkpoint automático quando o WAL passa do limite (antes de escrever,
@@ -1878,7 +1881,14 @@ fn kv_error(error: Error, legacy: &Error) -> Error {
 
 /// Apaga os WALs arquivados mais antigos até o total caber em `limit` bytes.
 fn prune_archive(dir: &Path, limit: u64) -> Result<()> {
-    let mut files: Vec<(PathBuf, u64)> = fs::read_dir(dir)?
+    // Sem nada arquivado ainda (WAL vazio no primeiro checkpoint com retenção), o
+    // diretório nem existe.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut files: Vec<(PathBuf, u64)> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|x| x == "wal"))
         .filter_map(|e| Some((e.path(), e.metadata().ok()?.len())))
