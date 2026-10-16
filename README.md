@@ -19,8 +19,12 @@ externa**. Um único motor oferece duas faces sobre o mesmo armazenamento:
   (`ON CONFLICT`, `INSERT OR REPLACE`), parâmetros (`?`, `$1`), comandos preparados,
   **scripts** e transações SQL (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`), **gatilhos**
   (`NEW`/`OLD`, `RAISE`), **views materializadas** (com atualização automática),
-  `NOTIFY`/`LISTEN` e **stream de mudanças** (SSE), `ANALYZE` com **planejador por
-  custo**, `EXPLAIN ANALYZE`.
+  `NOTIFY`/`LISTEN` e **stream de mudanças** (SSE), **Máquina Virtual de Bytecode (VM)**
+  para compilação e avaliação iterativa de expressões escalares puras (zero estouro de
+  pilha), **ordenação externa (External Merge Sort)** com *spill* para disco e
+  mesclagem streaming K-way (evitando OOM), `ANALYZE` com estimativa de cardinalidade
+  probabilística via **HyperLogLog (HLL)** (1 KiB fixo de RAM por coluna) e **planejador por
+  custo (CBO)**, `EXPLAIN ANALYZE`, comandos `SHOW CLUSTER` e `SHOW PEERS`.
 - **Busca avançada:** **full-text** com ranking BM25 (`CREATE FULLTEXT INDEX`,
   `MATCH (cols) AGAINST ('termo "frase" pref* -excluído OR outro')`, radicalização
   PT/EN, `fts_highlight`), **vetorial** com HNSW (`CREATE VECTOR INDEX ... WITH (metric
@@ -41,7 +45,9 @@ externa**. Um único motor oferece duas faces sobre o mesmo armazenamento:
   `ANALYZE`, papéis, `pg_stat_ssl`**; `\dt`, `\d` com FKs e gatilhos, `\df`, `\do`, `\dx`,
   `\du`... do psql funcionam) e **expressões regulares** (`~`, `regexp_replace`...).
   HTTP também em HTTPS (inclusive com certificado de cliente).
-- **Chave-valor:** `put`/`get`/`scan`, TTL por chave, lotes atômicos e índice por valor.
+- **Chave-valor e motores de armazenamento:** `put`/`get`/`scan`, TTL por chave, lotes atômicos,
+  índice por valor e motor de armazenamento alternativo **LSM-Tree** (`src/lsm.rs`) com MemTable,
+  SSTables com **Filtro Bloom residente** para zero I/O em chaves ausentes e índice esparso.
 
 Por baixo: páginas de 4 KiB, B+ Tree com **páginas de overflow** (valores de até
 64 MiB, chaves de até 1 KiB), buffer pool com **leitura paralela**, **compressão LZ77

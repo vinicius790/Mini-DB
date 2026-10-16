@@ -46,6 +46,7 @@ pub mod http;
 pub mod index;
 pub mod inspect;
 pub mod json;
+pub mod lsm;
 pub mod metrics;
 pub mod mvcc;
 pub mod page;
@@ -71,6 +72,7 @@ pub use db::{
 };
 pub use error::{Error, Result};
 pub use inspect::PageStats;
+pub use lsm::{LsmEngine, LsmMetrics, SsTable};
 pub use metrics::Metrics;
 pub use page::{MetaInfo, MAX_KEY_LEN, MAX_VALUE_LEN, PAGE_SIZE};
 pub use sql::{parse_sql, Statement};

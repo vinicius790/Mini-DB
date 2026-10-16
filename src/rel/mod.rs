@@ -52,7 +52,9 @@
 //! # Ok::<(), mini_db::Error>(())
 //! ```
 
+pub mod cbo;
 mod exec;
+pub mod extsort;
 pub mod func;
 pub mod parser;
 mod pgcatalog;
@@ -61,6 +63,7 @@ pub mod regex;
 pub mod rewrite;
 mod search;
 pub mod value;
+pub mod vm;
 mod window;
 mod write;
 
@@ -156,6 +159,7 @@ impl Prepared {
                 | parser::Stmt::ShowCreate(_)
                 | parser::Stmt::Describe(_)
                 | parser::Stmt::ShowUsers
+                | parser::Stmt::ShowCluster
                 | parser::Stmt::ShowGrants(_)
                 | parser::Stmt::Explain(..)
         )

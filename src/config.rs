@@ -1,4 +1,4 @@
-//! Configuração do processo: arquivo `minidb.toml` + variáveis de ambiente.
+﻿//! Configuração do processo: arquivo `minidb.toml` + variáveis de ambiente.
 //!
 //! Formato TOML reduzido (`chave = valor`). Env ganha do arquivo:
 //! `MINIDB_PATH`, `MINIDB_HTTP`, `MINIDB_TCP`, `MINIDB_POOL`, `MINIDB_FSYNC`,
@@ -56,10 +56,14 @@ pub struct Config {
     /// Modo cluster (eleição automática): identificador deste nó, maior que 0.
     pub cluster_id: u64,
     /// Outros nós do cluster, `id@endereço` separados por vírgula; vazio desliga
-    /// o modo cluster (ver `docs/REPLICA.md`).
+    /// o modo cluster (ver `docs/REPLICA.md`). Pode incluir o próprio nó: o
+    /// endereço dele é o anunciado aos outros nas trocas de membros. Depois da
+    /// primeira troca (`CLUSTER ADD/REMOVE`), vale a configuração gravada no banco.
     pub cluster_peers: String,
     /// Base do timeout de eleição em ms (cada nó sorteia entre ela e o dobro).
     pub election_timeout_ms: u64,
+    /// Número máximo de linhas em memória antes de spill para ordenação externa (ORDER BY) e joins.
+    pub max_in_memory_rows: usize,
 }
 
 impl Default for Config {
@@ -91,6 +95,7 @@ impl Default for Config {
             cluster_id: 0,
             cluster_peers: String::new(),
             election_timeout_ms: 1500,
+            max_in_memory_rows: 50_000,
         }
     }
 }
@@ -238,12 +243,31 @@ impl Config {
             ("MINIDB_CLUSTER_ID", "cluster_id"),
             ("MINIDB_CLUSTER_PEERS", "cluster_peers"),
             ("MINIDB_ELECTION_TIMEOUT_MS", "election_timeout_ms"),
+            ("MINIDB_MAX_IN_MEMORY_ROWS", "max_in_memory_rows"),
         ] {
             if let Ok(v) = env::var(var) {
                 set(&mut cfg, key, &v);
             }
         }
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Valida restrições críticas dos parâmetros de configuração.
+    pub fn validate(&self) -> Result<()> {
+        if self.pool_frames < 16 {
+            return Err(Error::InvalidInput("pool_frames deve ser no mínimo 16".into()));
+        }
+        if self.sync_replicas > 100 {
+            return Err(Error::InvalidInput("sync_replicas não pode exceder 100".into()));
+        }
+        if !self.cluster_peers.is_empty() && self.election_timeout_ms < 100 {
+            return Err(Error::InvalidInput("election_timeout_ms deve ser no mínimo 100".into()));
+        }
+        if self.max_connections == 0 {
+            return Err(Error::InvalidInput("max_connections deve ser >= 1".into()));
+        }
+        Ok(())
     }
 }
 
@@ -308,6 +332,7 @@ fn set(cfg: &mut Config, key: &str, v: &str) {
         "cluster_id" => num(v, &mut cfg.cluster_id),
         "cluster_peers" => cfg.cluster_peers = v.to_string(),
         "election_timeout_ms" => num(v, &mut cfg.election_timeout_ms),
+        "max_in_memory_rows" => num(v, &mut cfg.max_in_memory_rows),
         _ => {}
     }
 }

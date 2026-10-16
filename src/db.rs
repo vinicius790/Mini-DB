@@ -680,7 +680,6 @@ impl Db {
             self.repl.publish(lsn, ops);
             lsn
         };
-        self.repl.wait_for_replicas(lsn);
         Ok(lsn)
     }
 
@@ -712,7 +711,9 @@ impl Db {
         }
         self.maybe_checkpoint()?;
         let lsn = self.log(ops, txn_id)?;
-        self.apply_logged(ops, lsn)
+        let replicated = self.repl.wait_for_replicas(lsn);
+        self.apply_logged(ops, lsn)?;
+        replicated
     }
 
     /// Checkpoint automático quando o WAL passa do limite (antes de escrever,
@@ -2018,7 +2019,7 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(1) // 0 significa sem TTL; fallback 1
 }
 
 /// Instante absoluto de expiração; nunca 0 (0 significa "sem TTL").

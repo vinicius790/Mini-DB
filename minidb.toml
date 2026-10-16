@@ -32,9 +32,11 @@ sync_replicas = 0
 sync_timeout_ms = 0
 wal_retention_mb = 256
 
-# Failover automático (eleição estilo Raft; docs/REPLICA.md). Desligado sem
-# cluster_peers. Exige repl_secret; "--primary ADDR" é o endereço deste nó;
-# sync_replicas/sync_timeout_ms são ignorados (vale a maioria).
+# Failover automático (eleição estilo Raft com PreVote; docs/REPLICA.md). Desligado
+# sem cluster_peers. Exige repl_secret; "--primary ADDR" é o endereço deste nó;
+# sync_replicas/sync_timeout_ms são ignorados (vale a maioria dos membros).
+# cluster_peers é a configuração inicial: depois de um "CLUSTER ADD/REMOVE" no líder,
+# vale a configuração gravada no banco. Pode incluir o próprio nó (endereço anunciado).
 # cluster_id = 1
 # cluster_peers = "2@10.0.0.2:7001,3@10.0.0.3:7001"   # id@endereço dos outros nós
 # election_timeout_ms = 1500                           # base; sorteio entre 1x e 2x
@@ -42,3 +44,7 @@ wal_retention_mb = 256
 # Manutenção automática: checkpoint pelo tamanho do WAL e purge/vacuum periódicos.
 auto_checkpoint_mb = 64
 maintenance_secs = 60
+
+# Limite de linhas em memória antes de spill para ordenação externa (ORDER BY) e joins.
+max_in_memory_rows = 50000
+
