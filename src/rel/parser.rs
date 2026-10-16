@@ -798,6 +798,7 @@ pub enum Stmt {
         from: Vec<String>,
     },
     ShowUsers,
+    ShowCluster,
     ShowGrants(Option<String>),
     ShowTables,
     ShowIndexes(Option<String>),
@@ -1359,6 +1360,8 @@ impl<'s> Parser<'s> {
                     Ok(Stmt::ShowTables)
                 } else if self.eat_kw("users") || self.eat_kw("roles") {
                     Ok(Stmt::ShowUsers)
+                } else if self.eat_kw("cluster") || self.eat_kw("peers") {
+                    Ok(Stmt::ShowCluster)
                 } else if self.eat_kw("grants") {
                     Ok(Stmt::ShowGrants(if self.eat_kw("for") {
                         Some(self.ident()?)

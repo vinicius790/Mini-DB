@@ -162,15 +162,37 @@ pub fn backup(db: &mut Db, dest: &Path) -> Result<String> {
     }
     fs::create_dir_all(dest.join("wal"))?;
     let dir = db.dir().to_path_buf();
+    let key = crate::encryption::keyfile_path(&dir);
+    // A chave (ou o formato dela) mudou desde a base (`rekey`, `encrypt`, migração
+    // de formato): os segmentos novos não abririam com a base antiga. Recomeça com
+    // um backup completo no mesmo destino.
+    let rebase = read_manifest(dest)?.is_some()
+        && fs::read(&key).ok() != fs::read(dest.join("base/data.mdb.key")).ok();
+    if rebase {
+        for old in fs::read_dir(dest.join("wal"))?.filter_map(|e| e.ok()) {
+            fs::remove_file(old.path())?;
+        }
+        fs::remove_file(manifest_path(dest))?;
+    }
     let full = read_manifest(dest)?.is_none();
     if full {
         // Checkpoint: data.mdb passa a conter tudo até checkpoint_lsn.
         db.checkpoint()?;
         fs::create_dir_all(dest.join("base"))?;
         fs::copy(Db::data_path(&dir), dest.join("base/data.mdb"))?;
-        let key = crate::encryption::keyfile_path(&dir);
+        // Mapa de páginas (bancos cifrados v3): sem ele as páginas não abrem.
+        let map = crate::buffer::map_path(&Db::data_path(&dir));
+        let base_map = dest.join("base/data.mdb.pages");
+        if map.exists() {
+            fs::copy(&map, &base_map)?;
+        } else if base_map.exists() {
+            fs::remove_file(&base_map)?;
+        }
+        let base_key = dest.join("base/data.mdb.key");
         if key.exists() {
-            fs::copy(&key, dest.join("base/data.mdb.key"))?;
+            fs::copy(&key, &base_key)?;
+        } else if base_key.exists() {
+            fs::remove_file(&base_key)?;
         }
         let lsn = db.meta().checkpoint_lsn;
         let manifest = Json::obj()
@@ -255,6 +277,10 @@ pub fn restore(
     }
     fs::create_dir_all(dir)?;
     fs::copy(from.join("base/data.mdb"), Db::data_path(dir))?;
+    let map = from.join("base/data.mdb.pages");
+    if map.exists() {
+        fs::copy(&map, crate::buffer::map_path(&Db::data_path(dir)))?;
+    }
     let key = from.join("base/data.mdb.key");
     let encrypted = key.exists();
     if encrypted {

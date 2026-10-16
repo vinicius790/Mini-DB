@@ -255,7 +255,7 @@ impl SharedDb {
                 .map_err(poisoned)?
                 .maybe_checkpoint()?;
         }
-        let (ops, lsn, out) = {
+        let (ops, lsn, out, replicated) = {
             let db = self.read_unchecked()?;
             let (ops, internal, out) = plan(&db)?;
             db.validate_ops(&ops, internal)?;
@@ -272,13 +272,17 @@ impl SharedDb {
                 return Ok((out, lsn));
             }
             let lsn = db.log(&ops, None)?;
-            (ops, lsn, out)
+            // Espera antes de aplicar (só fica visível depois de confirmado). Sem
+            // a confirmação o lote já está no WAL: aplica e devolve o erro depois.
+            let replicated = db.repl.wait_for_replicas(lsn);
+            (ops, lsn, out, replicated)
         };
         self.inner
             .db
             .write()
             .map_err(poisoned)?
             .apply_logged(&ops, lsn)?;
+        replicated?;
         Ok((out, lsn))
     }
 

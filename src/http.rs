@@ -36,11 +36,21 @@ impl Drop for ConnectionGuard {
 }
 
 pub(crate) fn reserve_connection(active: &AtomicUsize, limit: usize) -> bool {
-    active
-        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
-            (count < limit).then_some(count + 1)
-        })
-        .is_ok()
+    let mut current = active.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Status HTTP de um erro do motor.
@@ -410,6 +420,11 @@ fn handle(
         if let Some(needed) = needed {
             crate::auth::authorize_object(&*db.read()?, p, "kv", needed)?;
         }
+        // Trocar membros do cluster: só superusuário (sem usuários, vale o token).
+        if method == "POST" && path.starts_with("/v1/cluster/") && !p.superuser {
+            let why = "trocar membros do cluster exige superusuário";
+            return Err(Error::Forbidden(why.into()));
+        }
     }
     if let Err(error) = validate_query(&query) {
         return bad_request(stream, &error.to_string());
@@ -740,6 +755,8 @@ fn allowed_methods(path: &str) -> Option<&'static str> {
             Some("POST, OPTIONS")
         }
         "/v1/replication" | "/v1/changes" | "/v1/listen" => Some("GET, OPTIONS"),
+        "/v1/cluster" => Some("GET, OPTIONS"),
+        "/v1/cluster/add" | "/v1/cluster/remove" => Some("POST, OPTIONS"),
         "/v1/kv" => Some("GET, PUT, POST, DELETE, OPTIONS"),
         "/v1/sql" => Some("POST, OPTIONS"),
         _ => None,
@@ -773,6 +790,9 @@ const OPENAPI_MIN: &str = r##"{
         "/v1/listen": {"get": {"parameters": [{"name": "channel", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "timeout", "in": "query", "schema": {"type": "integer", "minimum": 1}}], "responses": {"200": {"description": "NOTIFY messages as Server-Sent Events"}, "401": {"description": "Missing or invalid credentials"}, "403": {"description": "Requires SELECT on *"}, "503": {"description": "Connection limit reached"}}}},
         "/v1/replication": {"get": {"responses": {"200": {"description": "Role, epoch, LSNs, connected replicas and sync mode"}, "401": {"description": "Missing or invalid credentials"}, "503": {"description": "Connection limit reached"}}}},
         "/v1/replication/promote": {"post": {"responses": {"200": {"description": "Replica promoted to primary with a new epoch"}, "400": {"description": "Not a replica"}, "401": {"description": "Missing or invalid credentials"}, "503": {"description": "Connection limit reached"}}}},
+        "/v1/cluster": {"get": {"responses": {"200": {"description": "Cluster membership (index 0 and no members: the initial cluster_peers)"}, "401": {"description": "Missing or invalid credentials"}, "503": {"description": "Connection limit reached"}}}},
+        "/v1/cluster/add": {"post": {"requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["id", "addr"], "properties": {"id": {"type": "integer", "minimum": 1}, "addr": {"type": "string"}}}}}}, "responses": {"200": {"description": "New membership confirmed by the majority of the new configuration"}, "400": {"description": "Invalid input"}, "403": {"description": "Requires superuser"}, "503": {"description": "Not the leader, change in progress, or uncertain result"}}}},
+        "/v1/cluster/remove": {"post": {"requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer", "minimum": 1}}}}}}, "responses": {"200": {"description": "New membership confirmed by the majority of the new configuration"}, "400": {"description": "Invalid input"}, "403": {"description": "Requires superuser"}, "503": {"description": "Not the leader, change in progress, or uncertain result"}}}},
         "/v1/maintain": {"post": {"responses": {"200": {"description": "Checkpoint, purge and vacuum decided by the maintenance policy"}, "401": {"description": "Missing or invalid credentials"}, "500": {"description": "Database error"}, "503": {"description": "Connection limit reached"}}}}
     },
     "components": {"schemas": {
@@ -1358,6 +1378,26 @@ fn handle_extended(
             let epoch = crate::replication::promote(db)?;
             reply(stream, &[("epoch", Json::Number(epoch as i64))])
         })(),
+        ("GET", "/v1/cluster") => (|| {
+            let config = crate::replication::membership(db)?;
+            reply(stream, &cluster_json(config.as_ref()))
+        })(),
+        ("POST", "/v1/cluster/add" | "/v1/cluster/remove") => (|| {
+            let j = Json::parse(body).map_err(|e| Error::InvalidInput(e.to_string()))?;
+            let id = match j.get("id") {
+                Some(Json::Number(id)) if *id > 0 => *id as u64,
+                _ => return Err(Error::InvalidInput("id deve ser inteiro > 0".into())),
+            };
+            let change = if path == "/v1/cluster/add" {
+                let addr = j.get("addr").and_then(Json::as_str);
+                let addr = addr.ok_or_else(|| Error::InvalidInput("campo addr ausente".into()))?;
+                crate::raft::Change::Add(id, addr.to_string())
+            } else {
+                crate::raft::Change::Remove(id)
+            };
+            let config = crate::replication::change_membership(db, change)?;
+            reply(stream, &cluster_json(Some(&config)))
+        })(),
         ("POST", "/v1/maintain") => (|| {
             let r = db.write()?.maintain(0.25)?;
             reply(
@@ -1380,6 +1420,24 @@ fn handle_extended(
         ),
         other => other,
     })
+}
+
+/// Membros do cluster em JSON (`index` 0 sem membros: vale a configuração
+/// inicial, de `cluster_peers`).
+fn cluster_json(config: Option<&crate::raft::Membership>) -> [(&'static str, Json); 2] {
+    let mut members = Vec::new();
+    let mut index = 0;
+    if let Some(config) = config {
+        index = config.index as i64;
+        for (id, addr) in &config.members {
+            let member = Json::obj().put("id", Json::Number(*id as i64));
+            members.push(member.put("addr", Json::String(addr.clone())));
+        }
+    }
+    [
+        ("index", Json::Number(index)),
+        ("members", Json::Array(members)),
+    ]
 }
 
 /// Serializa o resultado de um comando SQL.

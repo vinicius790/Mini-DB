@@ -1,15 +1,18 @@
-//! Autenticação dos frames do WAL em bancos cifrados v2 (ChaCha20-Poly1305 por frame,
-//! encadeado pelo LSN do frame anterior): alterar, trocar de lugar, remover ou repetir
-//! um frame precisa falhar com `CorruptWal`, nunca aplicar dado errado. Banco em claro,
-//! cifra v1 e cauda rasgada continuam como antes.
+//! Autenticação dos frames do WAL em bancos cifrados v2/v3 (ChaCha20-Poly1305 por
+//! frame, encadeado pelo LSN do frame anterior): alterar, trocar de lugar, remover ou
+//! repetir um frame precisa falhar com `CorruptWal`, nunca aplicar dado errado. Banco
+//! em claro e cauda rasgada continuam como antes; um banco v1 com WAL pendente é
+//! recuperado e migrado.
 
 use mini_db::crypto::{hmac_sha256, pbkdf2_sha256};
-use mini_db::encryption::keyfile_path;
+use mini_db::encryption::{keyfile_path, Cipher};
 use mini_db::error::Error;
-use mini_db::wal::crc32;
+use mini_db::page::{Page, PAGE_SIZE};
+use mini_db::wal::{crc32, Wal, WalRecord};
 use mini_db::Db;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Sufixo único por processo: só pid + relógio colide entre testes paralelos.
 static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -39,8 +42,8 @@ fn val(i: usize) -> Vec<u8> {
     format!("valor-{i:03}").into_bytes()
 }
 
-/// `data.mdb.key` montado à mão, com poucas iterações: versão 1 = cifra legada (sem
-/// etiqueta), versão 2 = cifra autenticada.
+/// `data.mdb.key` montado à mão, com poucas iterações (versão 1 = cifra legada, sem
+/// etiqueta).
 fn write_key(dir: &Path, version: u8) {
     let salt = [9u8; 16];
     let iterations = 10u32;
@@ -139,7 +142,7 @@ fn fix_crc(wal: &mut [u8], start: usize, end: usize) {
 fn new_encrypted_db_recovers_authenticated_wal_after_crash() {
     let dir = tmpdir();
     fill(&dir, Some(PASS));
-    assert_eq!(fs::read(keyfile_path(&dir)).unwrap()[4], 2, "chave v2");
+    assert_eq!(fs::read(keyfile_path(&dir)).unwrap()[4], 3, "chave v3");
     let wal = fs::read(Db::wal_path(&dir)).unwrap();
     let all = frames(&wal);
     assert!(all.len() >= N, "um frame por put");
@@ -162,7 +165,6 @@ fn new_encrypted_db_recovers_authenticated_wal_after_crash() {
 #[test]
 fn flipped_byte_in_middle_frame_fails_even_with_crc_fixed() {
     let dir = tmpdir();
-    write_key(&dir, 2);
     fill(&dir, Some(PASS));
     check(&copy_db(&dir), Some(PASS), N).unwrap();
     let wal = fs::read(Db::wal_path(&dir)).unwrap();
@@ -193,7 +195,6 @@ fn flipped_byte_in_middle_frame_fails_even_with_crc_fixed() {
 #[test]
 fn swapped_removed_or_repeated_frames_fail() {
     let dir = tmpdir();
-    write_key(&dir, 2);
     fill(&dir, Some(PASS));
     let wal = fs::read(Db::wal_path(&dir)).unwrap();
     let all = frames(&wal);
@@ -214,7 +215,6 @@ fn swapped_removed_or_repeated_frames_fail() {
 #[test]
 fn torn_tail_is_ignored_but_forged_last_frame_is_not() {
     let dir = tmpdir();
-    write_key(&dir, 2);
     fill(&dir, Some(PASS));
     let wal = fs::read(Db::wal_path(&dir)).unwrap();
     let (start, end) = *frames(&wal).last().unwrap();
@@ -270,16 +270,47 @@ fn plaintext_wal_keeps_format_and_tail_semantics() {
 }
 
 #[test]
-fn legacy_v1_cipher_keeps_unauthenticated_frames_and_recovers() {
+fn legacy_v1_database_with_pending_wal_recovers_and_is_upgraded() {
     let dir = tmpdir();
+    // Banco v1 como uma versão antiga o deixaria: `base` em `data.mdb` (páginas v1)
+    // e `N` chaves só no WAL, em frames v1 (sal + texto cifrado, sem etiqueta).
+    {
+        let mut db = Db::open(&dir).unwrap();
+        db.put(b"base", b"0").unwrap();
+        db.close().unwrap();
+    }
+    let cipher = Cipher::from_passphrase(PASS, &[9u8; 16], 10).legacy();
+    let data = Db::data_path(&dir);
+    let mut bytes = fs::read(&data).unwrap();
+    for chunk in bytes.chunks_exact_mut(PAGE_SIZE) {
+        let mut page = Page::from_bytes(chunk).unwrap();
+        cipher.seal_page(&mut page);
+        chunk.copy_from_slice(&page.data);
+    }
+    fs::write(&data, bytes).unwrap();
     write_key(&dir, 1);
-    fill(&dir, Some(PASS));
+    {
+        let mut wal = Wal::open_with(Db::wal_path(&dir), 1_000, Some(Arc::new(cipher))).unwrap();
+        for i in 0..N {
+            let record = WalRecord::Insert {
+                lsn: 0,
+                key: key(i),
+                value: val(i),
+            };
+            wal.append(record).unwrap();
+        }
+        wal.sync().unwrap();
+    }
     let wal = fs::read(Db::wal_path(&dir)).unwrap();
     let (start, end) = *frames(&wal).last().unwrap();
     // v1: sal(4) + texto cifrado, sem etiqueta.
     assert_eq!(end - start, 8 + 9 + 4 + 8 + key(0).len() + val(0).len());
-    check(&copy_db(&dir), Some(PASS), N).unwrap();
+    // Cauda rasgada: só o último registro se perde.
     let copy = copy_db(&dir);
     patch_wal(&copy, |b| b.truncate(end - 7));
     check(&copy, Some(PASS), N - 1).unwrap();
+    // A abertura recupera o WAL v1 e migra o banco para v3 com a mesma chave.
+    check(&dir, Some(PASS), N).unwrap();
+    assert_eq!(fs::read(keyfile_path(&dir)).unwrap()[4], 3, "chave v3");
+    check(&dir, Some(PASS), N).unwrap();
 }

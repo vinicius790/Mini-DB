@@ -565,6 +565,7 @@ pub(super) fn plan_into(exec: &Exec<'_>, stmt: &Stmt, pending: &Pending) -> Resu
         Stmt::Query(_)
         | Stmt::ShowTables
         | Stmt::ShowUsers
+        | Stmt::ShowCluster
         | Stmt::ShowGrants(_)
         | Stmt::ShowIndexes(_)
         | Stmt::ShowTriggers(_)
@@ -2854,13 +2855,12 @@ fn refresh_materialized(exec: &Exec<'_>, pending: &Pending, t: &Table) -> Result
 // ---------------------------------------------------------------------------
 
 /// Um scan completo: contagem, distintos (exatos até 1 M), nulos, mínimo e
-/// máximo por coluna.
+/// Amostra a tabela inteira e calcula contagem, nulos, min, max e NDV via HyperLogLog (HLL)
+/// de memória constante (1 KiB por coluna).
 fn analyze_table(exec: &Exec<'_>, pending: &Pending, t: &Table) -> Result<usize> {
-    const MAX_DISTINCT: usize = 1_000_000;
     let n = t.columns.len();
     let mut rows = 0usize;
-    let mut distinct: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); n];
-    let mut saturated = vec![false; n];
+    let mut hlls: Vec<super::cbo::Hll> = (0..n).map(|_| super::cbo::Hll::new()).collect();
     let mut nulls = vec![0u64; n];
     let mut min: Vec<Option<Value>> = vec![None; n];
     let mut max: Vec<Option<Value>> = vec![None; n];
@@ -2871,13 +2871,7 @@ fn analyze_table(exec: &Exec<'_>, pending: &Pending, t: &Table) -> Result<usize>
                 nulls[i] += 1;
                 continue;
             }
-            if !saturated[i] {
-                distinct[i].insert(super::value::key_of(v));
-                if distinct[i].len() >= MAX_DISTINCT {
-                    saturated[i] = true;
-                    distinct[i].clear();
-                }
-            }
+            hlls[i].insert(&super::value::key_of(v));
             if min[i]
                 .as_ref()
                 .is_none_or(|m| v.total_cmp(m) == std::cmp::Ordering::Less)
@@ -2893,6 +2887,12 @@ fn analyze_table(exec: &Exec<'_>, pending: &Pending, t: &Table) -> Result<usize>
         }
         Ok(true)
     })?;
+
+    for (i, hll) in hlls.iter().enumerate() {
+        let key = super::cbo::hll_key(t.id, i as u16);
+        pending.put(key, hll.to_bytes());
+    }
+
     let clip = |v: Option<Value>| match v {
         Some(Value::Text(s)) if s.len() > 64 => Some(Value::Text(s.chars().take(64).collect())),
         other => other,
@@ -2901,11 +2901,7 @@ fn analyze_table(exec: &Exec<'_>, pending: &Pending, t: &Table) -> Result<usize>
         rows: rows as u64,
         columns: (0..n)
             .map(|i| ColStats {
-                distinct: if saturated[i] {
-                    rows as u64
-                } else {
-                    distinct[i].len() as u64
-                },
+                distinct: hlls[i].count(),
                 nulls: nulls[i],
                 min: clip(min[i].take()),
                 max: clip(max[i].take()),

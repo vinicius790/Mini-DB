@@ -140,16 +140,27 @@ claro comparada ao `token` quando só há token; `trust` num banco sem usuários
 `RESET`, `DISCARD`, `DEALLOCATE` e `SHOW parâmetro` são aceitos como no-op para os
 clientes.
 
-**COPY** (consulta simples, formato texto): `COPY tabela [(colunas)] FROM STDIN`,
+**COPY** (consulta simples, formatos texto e CSV): `COPY tabela [(colunas)] FROM STDIN`,
 `COPY tabela [(colunas)] TO STDOUT` e `COPY (SELECT ...) TO STDOUT`, com `[WITH]
-[(]FORMAT text, DELIMITER 'x', NULL 'x'[)]`. Delimitador padrão TAB, NULL como `\N`,
-escapes `\\ \n \r \t \b \f \v`, `\NNN` e `\xHH`; a linha `\.` encerra os dados. O `FROM
+[(]FORMAT text|csv, DELIMITER 'x', NULL 'x'[)]`. Texto: delimitador padrão TAB, NULL como
+`\N`, escapes `\\ \n \r \t \b \f \v`, `\NNN` e `\xHH`. **CSV** (como no PostgreSQL/psql):
+`WITH (FORMAT csv [, HEADER [true|false]] [, DELIMITER 'x'] [, NULL 'x'] [, QUOTE 'x']
+[, ESCAPE 'x'])` ou a forma antiga `WITH CSV [HEADER] [QUOTE 'x'] [ESCAPE 'x']`; padrões
+`,`, aspa `"`, ESCAPE igual à aspa e NULL = campo vazio **sem** aspas (`""` é texto vazio).
+Campos entre aspas podem ter delimitador, aspa dobrada e quebras de linha; `HEADER` descarta
+a 1ª linha na entrada e escreve os nomes das colunas na saída, que põe aspas em campos com
+delimitador, aspa, `\r`/`\n`, vazios ou iguais ao NULL. Opção desconhecida ou inválida
+(delimitador de mais de um caractere, igual à aspa, NULL contendo o delimitador...) é
+recusada; linha com número de colunas errado ou aspas sem fechamento dá erro com o número
+da linha. Nos dois formatos a linha `\.` encerra os dados e o `CopyInResponse`/
+`CopyOutResponse` anuncia formato geral texto (0, como o PostgreSQL faz no CSV). O `FROM
 STDIN` exige `INSERT` na tabela e o `TO STDOUT` exige `SELECT` (conferidos como num
 `INSERT`/`SELECT` comum); os dados são aplicados por `INSERT` parametrizados de 500
 linhas numa única transação (a do cliente, se aberta; senão uma própria): `CopyFail`,
 linha malformada ou violação de restrição devolvem `ErrorResponse` e nada fica gravado.
 Os valores chegam como texto e o motor converte para o tipo da coluna. Limites por
-`COPY FROM`: 256 MiB de dados e 1.000.000 de linhas. Não há CSV, BINARY, arquivo/`PROGRAM`
+`COPY FROM`: 256 MiB de dados e 1.000.000 de linhas. Não há BINARY, `FORCE_QUOTE`/
+`FORCE_NOT_NULL`, arquivo/`PROGRAM`
 nem `COPY` no protocolo estendido; o `COPY` precisa ser o único comando da mensagem
 `Query`. Um erro antes do `CopyInResponse` (tabela ou coluna inexistente, sem privilégio)
 é devolvido na hora; `CopyData` fora de um `COPY` é ignorado, como no PostgreSQL.

@@ -13,7 +13,7 @@ const BITS_PER_KEY: u64 = 10;
 /// Teto de uma camada (64 MiB); depois disso a última camada só enche.
 const MAX_LAYER_BYTES: usize = 64 << 20;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Layer {
     bits: Vec<u8>,
     keys: u64,
@@ -54,7 +54,7 @@ impl Layer {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bloom {
     /// Nunca vazio: a primeira camada existe desde `new`.
     layers: Vec<Layer>,
@@ -135,6 +135,64 @@ impl Bloom {
     pub fn size_bytes(&self) -> usize {
         self.layers.iter().map(|layer| layer.bits.len()).sum()
     }
+
+    /// Cria um novo filtro Bloom dimensionado para a quantidade esperada de chaves.
+    /// Útil para SSTables onde o número de chaves a gravar já é conhecido antecipadamente.
+    pub fn with_capacity(expected_keys: usize) -> Self {
+        if expected_keys == 0 {
+            return Self::new();
+        }
+        let needed_bytes = ((expected_keys as u64).saturating_mul(BITS_PER_KEY).saturating_add(7) / 8) as usize;
+        let nbytes = needed_bytes.max(64).min(MAX_LAYER_BYTES);
+        let nbytes = (nbytes + 63) & !63;
+        Self {
+            layers: vec![Layer::new(nbytes)],
+            inserts: 0,
+        }
+    }
+
+    /// Serializa o filtro Bloom em vetor de bytes para persistência (ex.: bloco de filtro em SSTable).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"BLOM");
+        out.extend_from_slice(&self.inserts.to_le_bytes());
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for layer in &self.layers {
+            out.extend_from_slice(&layer.keys.to_le_bytes());
+            out.extend_from_slice(&(layer.bits.len() as u32).to_le_bytes());
+            out.extend_from_slice(&layer.bits);
+        }
+        out
+    }
+
+    /// Desserializa o filtro Bloom a partir de bytes. Retorna `None` se corrompido ou truncado.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 16 || &bytes[0..4] != b"BLOM" {
+            return None;
+        }
+        let inserts = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+        let n_layers = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+        let mut offset = 16;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            if offset + 12 > bytes.len() {
+                return None;
+            }
+            let keys = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
+            let bits_len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().ok()?) as usize;
+            offset += 12;
+            if offset + bits_len > bytes.len() {
+                return None;
+            }
+            let bits = bytes[offset..offset + bits_len].to_vec();
+            offset += bits_len;
+            layers.push(Layer { bits, keys });
+        }
+        if layers.is_empty() {
+            layers.push(Layer::new(FIRST_BYTES));
+        }
+        Some(Self { layers, inserts })
+    }
 }
 
 #[cfg(test)]
@@ -181,5 +239,28 @@ mod tests {
         }
         assert_eq!(b.size_bytes(), FIRST_BYTES);
         assert_eq!(b.inserts(), 100_000);
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        let mut b = Bloom::new();
+        for i in 0..1000u32 {
+            b.insert(format!("key:{i}").as_bytes());
+        }
+        let bytes = b.to_bytes();
+        let decoded = Bloom::from_bytes(&bytes).expect("falha ao desserializar bloom");
+        assert_eq!(b.inserts(), decoded.inserts());
+        for i in 0..1000u32 {
+            assert!(decoded.may_contain(format!("key:{i}").as_bytes()));
+        }
+        assert!(!decoded.may_contain(b"non-existent-key-12345"));
+    }
+
+    #[test]
+    fn with_capacity_sizing() {
+        let b_small = Bloom::with_capacity(10);
+        let b_large = Bloom::with_capacity(100_000);
+        assert!(b_small.size_bytes() < FIRST_BYTES);
+        assert!(b_large.size_bytes() >= FIRST_BYTES);
     }
 }

@@ -6,11 +6,14 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::auth::Privilege;
 use crate::cmd;
 use crate::config::NetOptions;
 use crate::error::{Error, Result};
 use crate::http::{reserve_connection, ConnectionGuard};
-use crate::mvcc::SharedDb;
+use crate::mvcc::{Session, SharedDb};
+use crate::raft::Change;
+use crate::replication;
 
 /// Uma linha cabe um valor máximo com folga para o comando e a chave.
 const MAX_COMMAND_BYTES: usize = crate::page::MAX_VALUE_LEN + crate::page::MAX_KEY_LEN + 1024;
@@ -197,7 +200,11 @@ fn handle_client(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<
             }
             continue;
         }
-        match cmd::apply(&mut session, cmd_line) {
+        let reply = match cluster_command(&session, cmd_line) {
+            Some(reply) => reply,
+            None => cmd::apply(&mut session, cmd_line),
+        };
+        match reply {
             Ok(msg) => {
                 write!(writer, "{msg}")?;
                 if !msg.ends_with('\n') {
@@ -208,6 +215,55 @@ fn handle_client(db: &SharedDb, stream: TcpStream, opts: &NetOptions) -> Result<
         }
     }
     Ok(())
+}
+
+/// `CLUSTER` (membros do modo cluster), `CLUSTER ADD <id> <endereço>` e
+/// `CLUSTER REMOVE <id>` (só no líder; ver docs/REPLICA.md). `None` se a linha
+/// é outro comando. Trocar membros exige superusuário quando há usuários.
+fn cluster_command(session: &Session, line: &str) -> Option<Result<String>> {
+    let parts = cmd::split_cmd(line);
+    if !parts.first()?.eq_ignore_ascii_case("CLUSTER") {
+        return None;
+    }
+    let args: Vec<&str> = parts[1..].iter().map(String::as_str).collect();
+    Some(run_cluster(session, &args))
+}
+
+fn node_id(raw: &str) -> Result<u64> {
+    let bad = || Error::Cli(format!("id de nó inválido: {raw}"));
+    raw.parse::<u64>().map_err(|_| bad())
+}
+
+fn run_cluster(session: &Session, args: &[&str]) -> Result<String> {
+    let change = match args {
+        [] => None,
+        [op, id, addr] if op.eq_ignore_ascii_case("ADD") => {
+            Some(Change::Add(node_id(id)?, addr.to_string()))
+        }
+        [op, id] if op.eq_ignore_ascii_case("REMOVE") => Some(Change::Remove(node_id(id)?)),
+        _ => {
+            let usage = "uso: CLUSTER [ADD <id> <endereço> | REMOVE <id>]";
+            return Err(Error::Cli(usage.into()));
+        }
+    };
+    let db = session.db();
+    let config = match change {
+        Some(change) => {
+            if session.principal().is_some_and(|p| !p.superuser) {
+                let why = "trocar membros do cluster exige superusuário";
+                return Err(Error::Forbidden(why.into()));
+            }
+            Some(replication::change_membership(db, change)?)
+        }
+        None => {
+            session.authorize_object("kv", Privilege::Select)?;
+            replication::membership(db)?
+        }
+    };
+    Ok(match config {
+        Some(config) => format!("OK CLUSTER {}\n", config.encode()),
+        None => "OK CLUSTER inicial (cluster_peers)\n".into(),
+    })
 }
 
 #[cfg(test)]

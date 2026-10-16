@@ -547,7 +547,8 @@ pub fn required(stmt: &Stmt) -> Requirement {
         | Stmt::DropUser { .. }
         | Stmt::Grant { .. }
         | Stmt::Revoke { .. }
-        | Stmt::ShowUsers => Requirement::Superuser,
+        | Stmt::ShowUsers
+        | Stmt::ShowCluster => Requirement::Superuser,
         Stmt::ShowGrants(_)
         | Stmt::ShowTables
         | Stmt::ShowIndexes(_)

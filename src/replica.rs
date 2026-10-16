@@ -21,7 +21,15 @@ pub fn ship_snapshot(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()>
     let data = Db::data_path(src);
     let wal = Db::wal_path(src);
     if data.exists() {
-        copy_and_publish(&data, &Db::data_path(dst))?;
+        // Mapa de páginas (banco cifrado v3) pendente até o arquivo de dados chegar:
+        // uma queda entre os dois é resolvida na abertura do destino.
+        let map = crate::buffer::map_path(&data);
+        let dst_data = Db::data_path(dst);
+        if map.exists() {
+            copy_and_publish(&map, &crate::buffer::pending_map_path(&dst_data))?;
+        }
+        copy_and_publish(&data, &dst_data)?;
+        crate::buffer::install_page_map(&dst_data)?;
     }
     if wal.exists() {
         copy_and_publish(&wal, &Db::wal_path(dst))?;

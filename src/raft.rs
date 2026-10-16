@@ -1,11 +1,22 @@
 //! Eleição de líder no estilo Raft sobre a replicação lógica existente.
 //!
-//! Só a parte de eleição do Raft: termo, um voto por termo, maioria estrita,
-//! batimentos do líder e comparação de logs. O "log" é o da replicação
+//! Termo, um voto por termo, maioria estrita, batimentos do líder, comparação de
+//! logs, PreVote e troca de um membro por vez. O "log" é o da replicação
 //! ([`crate::replication`]): a posição de um nó é `(época, LSN)` ([`LogPos`]) e o
 //! termo vencedor vira a época do novo primário, então o fencing por época que já
-//! existe passa a recusar o líder antigo. Não há AppendEntries próprio, snapshots
-//! do log do Raft, mudança de membros em execução nem PreVote.
+//! existe passa a recusar o líder antigo. Não há AppendEntries próprio nem
+//! snapshots do log do Raft.
+//!
+//! **PreVote.** Antes de subir o termo, o nó pergunta aos membros se votariam
+//! nele; quem ouviu um líder há menos de um timeout de eleição, ou tem log mais
+//! atualizado, diz não. Um nó que ficou isolado não volta com termo alto
+//! forçando uma eleição.
+//!
+//! **Membros.** A configuração ([`Membership`]) é um registro do próprio log
+//! replicado: cada nó usa a mais recente que tem nos dados ([`Node::set_config`]),
+//! votos e maioria contam só os membros dela e o líder troca um membro por vez
+//! ([`Node::propose`]), o "single-server change" do Raft. Um nó fora da
+//! configuração não se candidata e o voto dele não conta.
 //!
 //! [`Node`] é uma máquina de estados pura: sem rede, sem relógio real (o instante
 //! entra por parâmetro) e sem disco. Quem a dirige grava [`Node::hard_state`]
@@ -43,11 +54,98 @@ pub struct HardState {
     pub voted_for: Option<NodeId>,
 }
 
+/// Configuração de membros: quem vota e o endereço de replicação de cada um.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Membership {
+    /// 0 = a inicial (`cluster_peers`); cada troca soma 1.
+    pub index: u64,
+    pub members: BTreeMap<NodeId, String>,
+}
+
+/// Troca de um membro.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Entra o nó `id`, com o endereço de replicação dado.
+    Add(NodeId, String),
+    /// Sai o nó `id`.
+    Remove(NodeId),
+}
+
+impl Membership {
+    /// Votos necessários: maioria estrita dos membros.
+    pub fn majority(&self) -> usize {
+        self.members.len() / 2 + 1
+    }
+
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.members.contains_key(&id)
+    }
+
+    /// A configuração seguinte, com uma única troca.
+    pub fn with(&self, change: &Change) -> Result<Membership> {
+        let mut members = self.members.clone();
+        match change {
+            Change::Add(id, addr) => {
+                let bad = |c: char| c == ',' || c.is_whitespace();
+                if *id == 0 || addr.is_empty() || addr.contains(bad) {
+                    return Err(invalid(format!("nó inválido: {id}@{addr:?}")));
+                }
+                if members.insert(*id, addr.clone()).is_some() {
+                    return Err(invalid(format!("o nó {id} já é membro")));
+                }
+            }
+            Change::Remove(id) => {
+                if members.remove(id).is_none() {
+                    return Err(invalid(format!("o nó {id} não é membro")));
+                }
+                if members.is_empty() {
+                    return Err(invalid("o último membro não pode sair".into()));
+                }
+            }
+        }
+        let index = self.index + 1;
+        Ok(Membership { index, members })
+    }
+
+    /// `índice id@endereço,id@endereço…`, como fica gravado nos dados.
+    pub fn encode(&self) -> String {
+        let members: Vec<String> = self
+            .members
+            .iter()
+            .map(|(id, addr)| format!("{id}@{addr}"))
+            .collect();
+        format!("{} {}", self.index, members.join(","))
+    }
+
+    /// Inverso de [`Membership::encode`].
+    pub fn decode(text: &str) -> Result<Membership> {
+        let parsed = text.split_once(' ').and_then(|(index, members)| {
+            let index = index.parse::<u64>().ok()?;
+            let members: BTreeMap<NodeId, String> =
+                parse_peers(members).ok()?.into_iter().collect();
+            (!members.is_empty()).then_some(Membership { index, members })
+        });
+        let corrupt = || Error::Other(format!("configuração do cluster corrompida: {text:?}"));
+        parsed.ok_or_else(corrupt)
+    }
+}
+
+fn invalid(why: String) -> Error {
+    Error::InvalidInput(why)
+}
+
+fn unavailable(why: &str) -> Error {
+    Error::Unavailable(why.to_string())
+}
+
 /// Papel do nó na eleição.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Segue o líder do termo (se conhecido).
     Follower,
+    /// Sem notícias do líder: perguntou aos membros se votariam nele (PreVote),
+    /// ainda sem subir o termo.
+    PreCandidate,
     /// Pediu votos neste termo.
     Candidate,
     /// Venceu a eleição deste termo.
@@ -57,6 +155,20 @@ pub enum State {
 /// Mensagens entre nós.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Message {
+    /// Pré-voto: votaria em `candidate` no termo `term` (o dele + 1)? Quem
+    /// responde não muda termo, voto nem relógio.
+    PreVote {
+        term: u64,
+        candidate: NodeId,
+        last: LogPos,
+    },
+    /// Resposta a [`Message::PreVote`]: `term` é o pedido, se concedido, ou o
+    /// termo de quem recusou.
+    PreVoteReply {
+        term: u64,
+        voter: NodeId,
+        granted: bool,
+    },
     /// Pedido de voto com a posição do log do candidato.
     RequestVote {
         term: u64,
@@ -128,31 +240,41 @@ fn mix(seed: u64) -> u64 {
 /// Máquina de estados da eleição de um nó.
 pub struct Node {
     id: NodeId,
-    peers: Vec<NodeId>,
+    /// Configuração em vigor neste nó.
+    config: Membership,
+    /// Líder: troca proposta e ainda não confirmada (no máximo uma).
+    pending: Option<Membership>,
     hard: HardState,
     state: State,
     leader: Option<NodeId>,
     timing: Timing,
     rng: u64,
-    /// Seguidor ou candidato: próxima eleição. Líder: próximo batimento.
+    /// Seguidor ou (pré-)candidato: próxima eleição. Líder: próximo batimento.
     deadline: Instant,
+    /// Pré-candidato: pré-votos recebidos. Candidato: votos.
     votes: BTreeSet<NodeId>,
+    /// Pré-candidato: posição do log anunciada, usada também na candidatura.
+    last: LogPos,
+    /// Último batimento aceito de um líder (no PreVote: o líder segue vivo).
+    heard: Option<Instant>,
     /// Líder: quando cada par respondeu um batimento pela última vez.
     contact: BTreeMap<NodeId, Instant>,
 }
 
 impl Node {
-    /// Nó que (re)começa como seguidor com o estado persistido `hard`.
+    /// Nó que (re)começa como seguidor com o estado persistido `hard` e a
+    /// configuração `config`.
     pub fn new(
         id: NodeId,
-        peers: Vec<NodeId>,
+        config: Membership,
         hard: HardState,
         timing: Timing,
         now: Instant,
     ) -> Self {
         let mut node = Self {
             id,
-            peers,
+            config,
+            pending: None,
             hard,
             state: State::Follower,
             leader: None,
@@ -160,6 +282,8 @@ impl Node {
             rng: mix(timing.seed),
             deadline: now,
             votes: BTreeSet::new(),
+            last: LogPos::default(),
+            heard: None,
             contact: BTreeMap::new(),
         };
         node.reset_election(now);
@@ -188,22 +312,32 @@ impl Node {
         self.hard
     }
 
-    /// Votos necessários: maioria estrita do cluster, contando este nó.
-    pub fn majority(&self) -> usize {
-        let nodes = self.peers.len() + 1;
-        nodes / 2 + 1
+    /// Configuração em vigor neste nó.
+    pub fn config(&self) -> &Membership {
+        &self.config
     }
 
-    /// Seguidor ou candidato cujo timeout de eleição venceu: o próximo
-    /// [`Node::on_timeout`] inicia uma eleição (se o nó tiver posição de log).
-    pub fn election_due(&self, now: Instant) -> bool {
-        self.state != State::Leader && now >= self.deadline
+    /// Líder: a troca proposta e ainda não confirmada.
+    pub fn pending(&self) -> Option<&Membership> {
+        self.pending.as_ref()
+    }
+
+    /// Votos necessários: maioria estrita dos membros da configuração.
+    pub fn majority(&self) -> usize {
+        self.config.majority()
+    }
+
+    /// Este nó está na configuração em vigor (pode se candidatar e seu voto conta).
+    pub fn is_member(&self) -> bool {
+        self.config.contains(self.id)
     }
 
     /// Avança os relógios. O líder manda batimentos e desiste se ficou um timeout
-    /// de eleição sem resposta da maioria; seguidor ou candidato sem notícias por
-    /// um timeout se candidata com termo + 1. `last` é a posição do log deste nó;
-    /// com `None` (ressincronizando) ele não se candidata.
+    /// de eleição sem resposta da maioria. Seguidor ou candidato sem notícias por
+    /// um timeout começa a pré-votação para o termo + 1, e só sobe o termo se a
+    /// maioria dos membros concordar. `last` é a posição do log deste nó; com
+    /// `None` (ressincronizando) ele não se candidata. Um nó fora da configuração
+    /// nunca se candidata e larga o líder que parou de lhe mandar batimentos.
     pub fn on_timeout(&mut self, now: Instant, last: Option<LogPos>) -> Vec<Action> {
         if self.state == State::Leader {
             return self.lead(now);
@@ -212,24 +346,26 @@ impl Node {
             return Vec::new();
         }
         self.reset_election(now);
+        if !self.is_member() {
+            self.state = State::Follower;
+            self.leader = None;
+            self.votes.clear();
+            return Vec::new();
+        }
         let last = match last {
             Some(last) => last,
             None => return Vec::new(),
         };
-        self.hard = HardState {
-            term: self.hard.term + 1,
-            voted_for: Some(self.id),
-        };
-        self.state = State::Candidate;
+        self.state = State::PreCandidate;
         self.leader = None;
+        self.last = last;
         self.votes = BTreeSet::from([self.id]);
         if self.votes.len() >= self.majority() {
-            return self.become_leader(now);
+            return self.campaign(now);
         }
-        let (term, candidate) = (self.hard.term, self.id);
-        let request = Message::RequestVote {
-            term,
-            candidate,
+        let request = Message::PreVote {
+            term: self.hard.term + 1,
+            candidate: self.id,
             last,
         };
         self.broadcast(request)
@@ -246,7 +382,7 @@ impl Node {
 
     /// Pedido de voto: concede no máximo um voto por termo, e só a candidato cujo
     /// log (`last`) é pelo menos tão atualizado quanto o deste nó (`mine`). Sem
-    /// posição (`mine = None`, ressincronizando) o nó nunca vota.
+    /// posição (`mine = None`) o nó nunca vota.
     pub fn on_request_vote(
         &mut self,
         now: Instant,
@@ -273,7 +409,7 @@ impl Node {
         out
     }
 
-    /// Resposta a um pedido de voto deste nó.
+    /// Resposta a um pedido de voto deste nó: só contam votos de membros.
     pub fn on_vote(
         &mut self,
         now: Instant,
@@ -285,7 +421,8 @@ impl Node {
         let counts = granted
             && self.state == State::Candidate
             && term == self.hard.term
-            && self.peers.contains(&voter);
+            && voter != self.id
+            && self.config.contains(voter);
         if counts {
             self.votes.insert(voter);
             if self.votes.len() >= self.majority() {
@@ -295,15 +432,64 @@ impl Node {
         out
     }
 
+    /// Pré-voto: concede se o termo pedido é maior que o deste nó, se o log do
+    /// candidato é pelo menos tão atualizado e se este nó não ouviu um líder há
+    /// menos de um timeout de eleição. Não muda termo, voto nem relógio.
+    pub fn on_pre_vote(
+        &self,
+        now: Instant,
+        term: u64,
+        last: LogPos,
+        mine: Option<LogPos>,
+    ) -> Vec<Action> {
+        let window = self.timing.election_min;
+        let recent = |at: Instant| now.saturating_duration_since(at) < window;
+        let alive = self.state == State::Leader || self.heard.is_some_and(recent);
+        let granted = term > self.hard.term && !alive && mine.is_some_and(|m| last >= m);
+        let reply = Message::PreVoteReply {
+            term: if granted { term } else { self.hard.term },
+            voter: self.id,
+            granted,
+        };
+        vec![Action::Reply(reply)]
+    }
+
+    /// Resposta a um pré-voto deste nó: com a maioria dos membros, candidata-se
+    /// de verdade. A recusa de quem está num termo maior faz este nó adotá-lo.
+    pub fn on_pre_vote_reply(
+        &mut self,
+        now: Instant,
+        term: u64,
+        voter: NodeId,
+        granted: bool,
+    ) -> Vec<Action> {
+        if !granted {
+            return self.observe(term, now);
+        }
+        let counts = self.state == State::PreCandidate
+            && term == self.hard.term + 1
+            && voter != self.id
+            && self.config.contains(voter);
+        if counts {
+            self.votes.insert(voter);
+            if self.votes.len() >= self.majority() {
+                return self.campaign(now);
+            }
+        }
+        Vec::new()
+    }
+
     /// Batimento de um líder: com o termo atual (ou maior) o nó passa a segui-lo
-    /// e adia a eleição. A resposta leva o termo deste nó, para um líder antigo
-    /// descobrir que foi substituído.
+    /// e adia a eleição, mesmo fora da configuração (um nó que está entrando
+    /// precisa achar o líder). A resposta leva o termo deste nó, para um líder
+    /// antigo descobrir que foi substituído.
     pub fn on_heartbeat(&mut self, now: Instant, term: u64, leader: NodeId) -> Vec<Action> {
         let mut out = self.observe(term, now);
         if term == self.hard.term && self.state != State::Leader {
             self.state = State::Follower;
             self.votes.clear();
             self.leader = Some(leader);
+            self.heard = Some(now);
             self.reset_election(now);
         }
         let (term, from) = (self.hard.term, self.id);
@@ -315,15 +501,22 @@ impl Node {
     pub fn on_heartbeat_ack(&mut self, now: Instant, term: u64, from: NodeId) -> Vec<Action> {
         let out = self.observe(term, now);
         let current = self.state == State::Leader && term == self.hard.term;
-        if current && self.peers.contains(&from) {
+        if current && from != self.id {
             self.contact.insert(from, now);
         }
         out
     }
 
-    /// Despacha `msg` para o tratador certo (`mine` só vale para pedidos de voto).
+    /// Despacha `msg` para o tratador certo (`mine` só vale para pedidos de voto
+    /// e de pré-voto).
     pub fn on_message(&mut self, now: Instant, msg: Message, mine: Option<LogPos>) -> Vec<Action> {
         match msg {
+            Message::PreVote { term, last, .. } => self.on_pre_vote(now, term, last, mine),
+            Message::PreVoteReply {
+                term,
+                voter,
+                granted,
+            } => self.on_pre_vote_reply(now, term, voter, granted),
             Message::RequestVote {
                 term,
                 candidate,
@@ -339,14 +532,68 @@ impl Node {
         }
     }
 
+    /// Líder: propõe trocar um membro. Recusa se este nó não lidera ou se já há
+    /// uma troca em andamento (uma por vez). Até [`Node::finish_change`], os
+    /// batimentos vão também ao nó que está entrando, para ele seguir o líder.
+    pub fn propose(&mut self, change: &Change) -> Result<Membership> {
+        if self.state != State::Leader {
+            return Err(unavailable("este nó não é o líder do cluster"));
+        }
+        if self.pending.is_some() {
+            return Err(unavailable("já há uma troca de membros em andamento"));
+        }
+        let next = self.config.with(change)?;
+        self.pending = Some(next.clone());
+        Ok(next)
+    }
+
+    /// Fim da troca proposta no termo `term`: confirmada pela maioria da
+    /// configuração nova, que passa a valer aqui (um líder que saiu dela deixa
+    /// de liderar), ou abandonada.
+    pub fn finish_change(&mut self, now: Instant, term: u64, committed: bool) -> Vec<Action> {
+        if self.state != State::Leader || term != self.hard.term {
+            return Vec::new();
+        }
+        match self.pending.take() {
+            Some(next) if committed => self.set_config(next, now),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Configuração em vigor: a mais recente gravada nos dados deste nó (no
+    /// líder, os dados só a mostram depois de confirmada). Um líder fora dela
+    /// deixa de liderar.
+    pub fn set_config(&mut self, config: Membership, now: Instant) -> Vec<Action> {
+        if config == self.config {
+            return Vec::new();
+        }
+        self.config = config;
+        if self.state != State::Leader {
+            return Vec::new();
+        }
+        if !self.is_member() {
+            self.become_follower(now);
+            return vec![Action::StepDown];
+        }
+        // Membro novo ganha a carência de um timeout para responder.
+        for &id in self.config.members.keys() {
+            if id != self.id {
+                self.contact.entry(id).or_insert(now);
+            }
+        }
+        Vec::new()
+    }
+
     fn lead(&mut self, now: Instant) -> Vec<Action> {
         let window = self.timing.election_min;
+        let recent = |at: &Instant| now.saturating_duration_since(*at) <= window;
         let alive = self
-            .contact
-            .values()
-            .filter(|&&at| now.saturating_duration_since(at) <= window)
+            .config
+            .members
+            .keys()
+            .filter(|&&id| id != self.id && self.contact.get(&id).is_some_and(recent))
             .count();
-        if alive + 1 < self.majority() {
+        if alive + usize::from(self.is_member()) < self.majority() {
             self.become_follower(now);
             return vec![Action::StepDown];
         }
@@ -362,19 +609,46 @@ impl Node {
         self.broadcast(Message::Heartbeat { term, leader })
     }
 
+    /// Envia `msg` aos membros e, durante uma troca, ao nó que está entrando.
     fn broadcast(&self, msg: Message) -> Vec<Action> {
-        self.peers
-            .iter()
-            .map(|&to| Action::Send { to, msg })
-            .collect()
+        let mut peers: BTreeSet<NodeId> = self.config.members.keys().copied().collect();
+        if let Some(next) = &self.pending {
+            peers.extend(next.members.keys().copied());
+        }
+        peers.remove(&self.id);
+        let send = |to| Action::Send { to, msg };
+        peers.into_iter().map(send).collect()
+    }
+
+    /// Pré-votação vencida (ou nó único): candidatura de verdade, com termo + 1.
+    fn campaign(&mut self, now: Instant) -> Vec<Action> {
+        self.hard = HardState {
+            term: self.hard.term + 1,
+            voted_for: Some(self.id),
+        };
+        self.state = State::Candidate;
+        self.votes = BTreeSet::from([self.id]);
+        self.reset_election(now);
+        if self.votes.len() >= self.majority() {
+            return self.become_leader(now);
+        }
+        let request = Message::RequestVote {
+            term: self.hard.term,
+            candidate: self.id,
+            last: self.last,
+        };
+        self.broadcast(request)
     }
 
     fn become_leader(&mut self, now: Instant) -> Vec<Action> {
         self.state = State::Leader;
         self.leader = Some(self.id);
         self.votes.clear();
+        self.pending = None;
         // Carência de um timeout para os pares responderem ao primeiro batimento.
-        self.contact = self.peers.iter().map(|&peer| (peer, now)).collect();
+        let me = self.id;
+        let peers = self.config.members.keys().filter(|&&id| id != me);
+        self.contact = peers.map(|&id| (id, now)).collect();
         self.deadline = now + self.timing.heartbeat();
         let term = self.hard.term;
         let mut out = vec![Action::BecomeLeader { term }];
@@ -387,6 +661,7 @@ impl Node {
         self.leader = None;
         self.votes.clear();
         self.contact.clear();
+        self.pending = None;
         self.reset_election(now);
     }
 
@@ -425,16 +700,6 @@ impl Node {
 }
 
 impl Message {
-    /// Termo de quem enviou.
-    pub fn term(&self) -> u64 {
-        match *self {
-            Message::RequestVote { term, .. }
-            | Message::Vote { term, .. }
-            | Message::Heartbeat { term, .. }
-            | Message::HeartbeatAck { term, .. } => term,
-        }
-    }
-
     /// `[tipo:u8][termo:u64][nó:u64][época:u64][lsn:u64][voto:u8]`.
     pub fn encode(&self) -> Vec<u8> {
         let none = LogPos::default();
@@ -451,6 +716,16 @@ impl Message {
             } => (2, term, voter, none, granted),
             Message::Heartbeat { term, leader } => (3, term, leader, none, false),
             Message::HeartbeatAck { term, from } => (4, term, from, none, false),
+            Message::PreVote {
+                term,
+                candidate,
+                last,
+            } => (5, term, candidate, last, false),
+            Message::PreVoteReply {
+                term,
+                voter,
+                granted,
+            } => (6, term, voter, none, granted),
         };
         let mut out = Vec::with_capacity(MESSAGE_LEN);
         out.push(kind);
@@ -488,6 +763,16 @@ impl Message {
             },
             (3, 0) => Message::Heartbeat { term, leader: id },
             (4, 0) => Message::HeartbeatAck { term, from: id },
+            (5, 0) => Message::PreVote {
+                term,
+                candidate: id,
+                last,
+            },
+            (6, flag @ 0..=1) => Message::PreVoteReply {
+                term,
+                voter: id,
+                granted: flag == 1,
+            },
             _ => return None,
         })
     }
@@ -565,6 +850,11 @@ mod tests {
         Timing::new(Duration::from_millis(150), seed)
     }
 
+    fn membership(ids: &[NodeId]) -> Membership {
+        let members = ids.iter().map(|&id| (id, format!("n{id}"))).collect();
+        Membership { index: 0, members }
+    }
+
     fn sent_to(out: &[Action], to: NodeId) -> Message {
         out.iter()
             .find_map(|a| match *a {
@@ -587,6 +877,10 @@ mod tests {
         matches!(reply_of(out), Message::Vote { granted: true, .. })
     }
 
+    fn pre_granted(out: &[Action]) -> bool {
+        matches!(reply_of(out), Message::PreVoteReply { granted: true, .. })
+    }
+
     /// Cluster em memória com entrega controlada: mensagens vão para uma fila e
     /// só chegam se o destino estiver no ar e o enlace não estiver cortado.
     struct Sim {
@@ -602,12 +896,17 @@ mod tests {
 
     impl Sim {
         fn new(n: u64, seed: u64) -> Self {
+            let all: Vec<NodeId> = (1..=n).collect();
+            Self::with_members(n, &all, seed)
+        }
+
+        /// `n` nós no ar, mas só `members` na configuração inicial de todos.
+        fn with_members(n: u64, members: &[NodeId], seed: u64) -> Self {
             let now = Instant::now();
             let nodes = (1..=n)
                 .map(|id| {
-                    let peers = (1..=n).filter(|&p| p != id).collect();
-                    let hard = HardState::default();
-                    Node::new(id, peers, hard, timing(seed * 31 + id), now)
+                    let (config, hard) = (membership(members), HardState::default());
+                    Node::new(id, config, hard, timing(seed * 31 + id), now)
                 })
                 .collect();
             Self {
@@ -623,6 +922,10 @@ mod tests {
 
         fn node(&self, id: NodeId) -> &Node {
             &self.nodes[id as usize - 1]
+        }
+
+        fn node_mut(&mut self, id: NodeId) -> &mut Node {
+            &mut self.nodes[id as usize - 1]
         }
 
         /// Corta, nos dois sentidos, todo enlace entre `group` e o resto.
@@ -680,6 +983,32 @@ mod tests {
             }
         }
 
+        /// Escrita do líder que a replicação leva a `to`: a posição de todos eles
+        /// avança e, sendo um registro de configuração, ela passa a valer em cada
+        /// seguidor. No líder, só vale em [`Sim::commit`] (os dados dele só a
+        /// mostram depois de confirmada).
+        fn write(&mut self, leader: NodeId, to: &[NodeId], config: Option<&Membership>) {
+            let term = self.node(leader).term();
+            let lsn = self.logs[leader as usize - 1].map_or(0, |p| p.lsn) + 1;
+            let pos = Some(LogPos { epoch: term, lsn });
+            self.logs[leader as usize - 1] = pos;
+            for &id in to.iter().filter(|&&id| id != leader) {
+                self.logs[id as usize - 1] = pos;
+                if let Some(config) = config {
+                    let now = self.now;
+                    let out = self.node_mut(id).set_config(config.clone(), now);
+                    self.apply(id, out, None);
+                }
+            }
+        }
+
+        /// O líder fica sabendo se a troca proposta foi confirmada.
+        fn commit(&mut self, leader: NodeId, committed: bool) {
+            let (now, term) = (self.now, self.node(leader).term());
+            let out = self.node_mut(leader).finish_change(now, term, committed);
+            self.apply(leader, out, None);
+        }
+
         fn current_leaders(&self) -> Vec<NodeId> {
             self.nodes
                 .iter()
@@ -726,9 +1055,10 @@ mod tests {
     }
 
     #[test]
-    fn vote_compares_epoch_before_lsn_and_a_resyncing_node_never_votes() {
+    fn vote_compares_epoch_before_lsn_and_a_node_without_position_never_votes() {
         let now = Instant::now();
-        let mut node = Node::new(3, vec![1, 2], HardState::default(), timing(7), now);
+        let config = membership(&[1, 2, 3]);
+        let mut node = Node::new(3, config, HardState::default(), timing(7), now);
         let old_big = LogPos { epoch: 1, lsn: 99 };
         let new_small = LogPos { epoch: 2, lsn: 1 };
         let out = node.on_request_vote(now, 1, 1, old_big, Some(new_small));
@@ -736,7 +1066,7 @@ mod tests {
         let out = node.on_request_vote(now, 2, 2, new_small, Some(old_big));
         assert!(granted(&out));
         let out = node.on_request_vote(now, 3, 1, new_small, None);
-        assert!(!granted(&out), "ressincronizando não vota");
+        assert!(!granted(&out), "sem posição não vota");
         assert_eq!(node.term(), 3, "mas adota o termo");
         let later = now + Duration::from_secs(10);
         let out = node.on_timeout(later, None);
@@ -783,12 +1113,25 @@ mod tests {
     #[test]
     fn split_vote_is_resolved_in_a_later_term() {
         let mut sim = Sim::new(4, 3);
-        // 1 e 2 se candidatam no mesmo instante; 3 ouve o 1 primeiro e 4, o 2.
+        // 1 e 2 vencem a pré-votação no mesmo instante; 3 ouve o 1 primeiro e 4, o 2.
         sim.now += Duration::from_secs(1);
         let now = sim.now;
-        let a = sim.nodes[0].on_timeout(now, Some(START));
-        let b = sim.nodes[1].on_timeout(now, Some(START));
+        let pre = sim.nodes[0].on_timeout(now, Some(START));
+        sim.nodes[1].on_timeout(now, Some(START));
+        let first = sent_to(&pre, 3);
+        assert!(matches!(first, Message::PreVote { term: 1, .. }));
+        assert_eq!(sim.node(1).term(), 0, "a pré-votação não sobe o termo");
+        let yes = |voter| Message::PreVoteReply {
+            term: 1,
+            voter,
+            granted: true,
+        };
+        sim.nodes[0].on_message(now, yes(3), None);
+        let a = sim.nodes[0].on_message(now, yes(4), None);
+        sim.nodes[1].on_message(now, yes(3), None);
+        let b = sim.nodes[1].on_message(now, yes(4), None);
         let split = sim.node(1).term();
+        assert_eq!(split, 1);
         assert_eq!(sim.node(2).term(), split);
         sim.queue.push_back((1, 3, sent_to(&a, 3)));
         sim.queue.push_back((2, 4, sent_to(&b, 4)));
@@ -808,14 +1151,170 @@ mod tests {
     }
 
     #[test]
+    fn isolated_node_does_not_raise_its_term_nor_force_an_election_on_return() {
+        for seed in 1..=10 {
+            let mut sim = Sim::new(3, seed);
+            sim.run(Duration::from_secs(2));
+            let leader = sim.current_leaders()[0];
+            let term = sim.node(leader).term();
+            let lonely = (1..=3).find(|&id| id != leader).unwrap();
+            sim.isolate(&[lonely]);
+            sim.run(Duration::from_secs(3));
+            // A pré-votação nunca vence isolada, então o termo não sobe.
+            assert_eq!(sim.node(lonely).term(), term, "seed={seed}");
+            sim.cut.clear();
+            sim.run(Duration::from_secs(2));
+            assert_eq!(sim.current_leaders(), vec![leader], "seed={seed}");
+            assert_eq!(sim.node(leader).term(), term, "nenhuma eleição forçada");
+            assert_eq!(sim.node(lonely).leader(), Some(leader));
+        }
+    }
+
+    #[test]
+    fn pre_vote_is_refused_while_a_leader_is_heard_and_never_changes_the_voter() {
+        let now = Instant::now();
+        let config = membership(&[1, 2, 3]);
+        let mut node = Node::new(3, config, HardState::default(), timing(9), now);
+        node.on_heartbeat(now, 4, 1);
+        let soon = now + Duration::from_millis(50);
+        let out = node.on_pre_vote(soon, 5, START, Some(START));
+        assert!(!pre_granted(&out), "o líder segue vivo");
+        let late = now + Duration::from_secs(1);
+        let out = node.on_pre_vote(late, 5, START, Some(START));
+        assert!(pre_granted(&out));
+        let out = node.on_pre_vote(late, 4, START, Some(START));
+        assert!(!pre_granted(&out), "termo pedido não é maior");
+        assert_eq!((node.term(), node.hard_state().voted_for), (4, None));
+        assert_eq!(node.leader(), Some(1));
+    }
+
+    #[test]
+    fn adding_a_fourth_node_changes_the_majority() {
+        for seed in 1..=10 {
+            // O nó 4 já roda, mas fora da configuração: não se candidata.
+            let mut sim = Sim::with_members(4, &[1, 2, 3], seed);
+            sim.run(Duration::from_secs(2));
+            let leaders = sim.current_leaders();
+            assert_eq!(leaders.len(), 1, "seed={seed}");
+            let leader = leaders[0];
+            assert_ne!(leader, 4);
+            assert_eq!(sim.node(4).term(), 0, "fora da configuração");
+            let add = Change::Add(4, "n4".into());
+            let next = sim.node_mut(leader).propose(&add).unwrap();
+            assert_eq!((next.index, next.members.len()), (1, 4));
+            let again = sim.node_mut(leader).propose(&Change::Remove(1));
+            assert!(again.is_err(), "uma troca por vez");
+            // Durante a troca, o líder já manda batimentos ao nó que está entrando.
+            sim.run(Duration::from_millis(300));
+            assert_eq!(sim.node(4).leader(), Some(leader), "seed={seed}");
+            sim.write(leader, &[1, 2, 3, 4], Some(&next));
+            sim.commit(leader, true);
+            for id in 1..=4 {
+                assert_eq!(sim.node(id).majority(), 3);
+                assert!(sim.node(id).is_member());
+            }
+            // Com quatro membros, dois de cada lado não elegem ninguém (antes,
+            // dois de três bastavam).
+            let other = (1..=3).find(|&id| id != leader).unwrap();
+            sim.isolate(&[leader, other]);
+            let elected = sim.leaders.len();
+            sim.run(Duration::from_secs(2));
+            assert!(sim.current_leaders().is_empty(), "seed={seed}");
+            assert_eq!(sim.leaders.len(), elected, "seed={seed}");
+            sim.cut.clear();
+            sim.run(Duration::from_secs(3));
+            assert_eq!(sim.current_leaders().len(), 1, "seed={seed}");
+        }
+    }
+
+    #[test]
+    fn removed_node_never_campaigns_and_does_not_count() {
+        for seed in 1..=10 {
+            let mut sim = Sim::new(3, seed);
+            sim.run(Duration::from_secs(2));
+            let leader = sim.current_leaders()[0];
+            let gone = (1..=3).find(|&id| id != leader).unwrap();
+            let remove = Change::Remove(gone);
+            let next = sim.node_mut(leader).propose(&remove).unwrap();
+            sim.write(leader, &[1, 2, 3], Some(&next));
+            sim.commit(leader, true);
+            assert!(!sim.node(gone).is_member());
+            assert_eq!(sim.node(leader).majority(), 2);
+            let term = sim.node(gone).term();
+            sim.run(Duration::from_secs(2));
+            // O líder segue sem mandar batimentos ao removido, que não se candidata.
+            assert_eq!(sim.current_leaders(), vec![leader], "seed={seed}");
+            assert_eq!(sim.node(gone).term(), term);
+            assert_eq!(sim.node(gone).leader(), None);
+            // Sem o líder, o membro que sobrou não se elege sozinho: o removido
+            // não conta.
+            sim.isolate(&[leader]);
+            let elected = sim.leaders.len();
+            sim.run(Duration::from_secs(2));
+            assert!(sim.current_leaders().is_empty(), "seed={seed}");
+            assert_eq!(sim.leaders.len(), elected);
+        }
+    }
+
+    #[test]
+    fn leader_that_removes_itself_steps_down_only_after_the_commit() {
+        for seed in 1..=10 {
+            let mut sim = Sim::new(3, seed);
+            sim.run(Duration::from_secs(2));
+            let old = sim.current_leaders()[0];
+            let term = sim.node(old).term();
+            let remove = Change::Remove(old);
+            let next = sim.node_mut(old).propose(&remove).unwrap();
+            sim.write(old, &[1, 2, 3], Some(&next));
+            // Os outros já usam a configuração nova; o líder segue até a confirmação.
+            sim.run(Duration::from_millis(100));
+            assert_eq!(sim.node(old).state(), State::Leader, "seed={seed}");
+            sim.commit(old, true);
+            assert_eq!(sim.node(old).state(), State::Follower);
+            assert!(!sim.node(old).is_member());
+            sim.run(Duration::from_secs(2));
+            let leaders = sim.current_leaders();
+            assert_eq!(leaders.len(), 1, "seed={seed}");
+            assert_ne!(leaders[0], old);
+            assert!(sim.node(leaders[0]).term() > term);
+            assert!(sim.leaders.range(term + 1..).all(|(_, &id)| id != old));
+        }
+    }
+
+    #[test]
+    fn only_the_leader_changes_members_and_only_one_change_at_a_time() {
+        let mut sim = Sim::new(3, 5);
+        sim.run(Duration::from_secs(2));
+        let leader = sim.current_leaders()[0];
+        let follower = (1..=3).find(|&id| id != leader).unwrap();
+        let refused = sim.node_mut(follower).propose(&Change::Remove(leader));
+        assert!(refused.is_err(), "seguidor não troca membros");
+        let node = sim.node_mut(leader);
+        let member = Change::Add(3, "x".into());
+        assert!(node.propose(&member).is_err(), "já é membro");
+        let spaces = Change::Add(9, "a b".into());
+        assert!(node.propose(&spaces).is_err(), "endereço inválido");
+        assert!(node.propose(&Change::Remove(7)).is_err(), "não é membro");
+        node.propose(&Change::Add(4, "n4".into())).unwrap();
+        let second = Change::Remove(follower);
+        assert!(node.propose(&second).is_err(), "concorrente");
+        sim.commit(leader, false);
+        assert_eq!(sim.node(leader).config().members.len(), 3, "abandonada");
+        assert_eq!(sim.node(leader).pending(), None);
+        let next = sim.node_mut(leader).propose(&second).unwrap();
+        assert_eq!((next.index, next.members.len()), (1, 2));
+    }
+
+    #[test]
     fn persisted_vote_is_not_given_twice_in_the_same_term_after_restart() {
         let name = format!("minidb-raft-unit-{}", std::process::id());
         let dir = std::env::temp_dir().join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (now, pos) = (Instant::now(), Some(START));
+        let config = membership(&[1, 2, 3]);
         assert_eq!(load_hard_state(&dir).unwrap(), HardState::default());
-        let mut node = Node::new(3, vec![1, 2], HardState::default(), timing(1), now);
+        let mut node = Node::new(3, config.clone(), HardState::default(), timing(1), now);
         let out = node.on_request_vote(now, 5, 1, START, pos);
         assert!(granted(&out));
         save_hard_state(&dir, node.hard_state()).unwrap();
@@ -827,7 +1326,7 @@ mod tests {
             voted_for: Some(1),
         };
         assert_eq!(hard, expected);
-        let mut node = Node::new(3, vec![1, 2], hard, timing(1), now);
+        let mut node = Node::new(3, config, hard, timing(1), now);
         let out = node.on_request_vote(now, 5, 2, START, pos);
         assert!(!granted(&out), "outro candidato no mesmo termo");
         let out = node.on_request_vote(now, 5, 1, START, pos);
@@ -859,6 +1358,16 @@ mod tests {
             },
             Message::Heartbeat { term, leader },
             Message::HeartbeatAck { term, from },
+            Message::PreVote {
+                term: 8,
+                candidate: 2,
+                last,
+            },
+            Message::PreVoteReply {
+                term: 8,
+                voter: 1,
+                granted: true,
+            },
         ];
         for msg in msgs {
             let bytes = msg.encode();
@@ -874,6 +1383,13 @@ mod tests {
         assert!(parse_peers("").unwrap().is_empty());
         for bad in ["a:1", "0@a:1", "2@", "2@a:1,2@b:1"] {
             assert!(parse_peers(bad).is_err(), "{bad}");
+        }
+        let add = Change::Add(9, "c@d:3".into());
+        let config = membership(&[1, 4]).with(&add).unwrap();
+        assert_eq!(config.encode(), "1 1@n1,4@n4,9@c@d:3");
+        assert_eq!(Membership::decode(&config.encode()).unwrap(), config);
+        for bad in ["", "7", "x 1@a", "7 ", "7 0@a"] {
+            assert!(Membership::decode(bad).is_err(), "{bad:?}");
         }
     }
 }

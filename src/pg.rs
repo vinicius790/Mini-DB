@@ -8,7 +8,7 @@
 //! em formato texto; parâmetros chegam em texto ou binário (inteiros, reais,
 //! booleanos e texto). Comandos de sessão dos clientes (`SET`, `SHOW x`,
 //! `RESET`, `DISCARD`, `DEALLOCATE`) são aceitos como no-op. `COPY ... FROM STDIN` e
-//! `COPY ... TO STDOUT` (formato texto) valem na consulta simples.
+//! `COPY ... TO STDOUT` (formatos texto e CSV) valem na consulta simples.
 
 use crate::auth::{self, Privilege, ScramServer};
 use crate::config::NetOptions;
@@ -819,7 +819,7 @@ impl Conn<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// COPY (formato texto)
+// COPY (formatos texto e CSV)
 // ---------------------------------------------------------------------------
 
 /// Teto dos bytes de dados de um `COPY ... FROM STDIN` (ficam em memória até o `CopyDone`).
@@ -837,6 +837,11 @@ enum CopyTarget {
 struct CopyOpts {
     delim: u8,
     null: String,
+    /// Formato CSV (senão, texto); `header`, `quote` e `escape` só valem nele.
+    csv: bool,
+    header: bool,
+    quote: u8,
+    escape: u8,
 }
 
 struct CopySpec {
@@ -964,13 +969,34 @@ fn copy_name(tok: Option<CopyTok>) -> Result<String> {
     }
 }
 
-/// `[WITH] [(] FORMAT text, DELIMITER 'x', NULL 'x' [)]` (CSV e BINARY: não suportados).
+/// Valor booleano opcional de `HEADER` (`true`/`on`/`1` ou `false`/`off`/`0`).
+fn copy_bool(tok: &CopyTok) -> Option<bool> {
+    match tok {
+        CopyTok::Word(w) if matches!(w.as_str(), "true" | "on" | "1") => Some(true),
+        CopyTok::Word(w) if matches!(w.as_str(), "false" | "off" | "0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Opção de um só caractere ASCII (`None`: o padrão).
+fn one_char(v: Option<String>, default: u8, what: &str) -> Result<u8> {
+    match v {
+        None => Ok(default),
+        Some(s) if s.len() == 1 && s.is_ascii() => Ok(s.as_bytes()[0]),
+        Some(_) => Err(bad(&format!("{what}: um caractere ASCII"))),
+    }
+}
+
+/// `[WITH] [(] FORMAT text|csv, HEADER [bool], DELIMITER 'x', NULL 'x', QUOTE 'x',
+/// ESCAPE 'x' [)]` e a forma antiga `[WITH] DELIMITER [AS] 'x' NULL [AS] 'x' CSV [HEADER]
+/// [QUOTE [AS] 'x'] [ESCAPE [AS] 'x']` (BINARY: não suportado).
 fn parse_copy_opts(toks: Vec<CopyTok>) -> Result<CopyOpts> {
     let mut it = toks.into_iter().peekable();
     let _ = it.next_if(|t| matches!(t, CopyTok::Word(w) if w == "with"));
     let paren = it.next_if(|t| matches!(t, CopyTok::Sym('('))).is_some();
     let mut closed = !paren;
-    let (mut delim, mut null) = (None, None);
+    let (mut csv, mut header) = (false, None);
+    let (mut delim, mut null, mut quote, mut escape) = (None, None, None, None);
     while let Some(tok) = it.next() {
         let name = match tok {
             CopyTok::Word(w) => w,
@@ -983,17 +1009,26 @@ fn parse_copy_opts(toks: Vec<CopyTok>) -> Result<CopyOpts> {
         };
         match name.as_str() {
             "format" => match it.next() {
-                Some(CopyTok::Word(f)) if f == "text" => {}
-                _ => return Err(bad("só FORMAT text (sem CSV/BINARY)")),
+                Some(CopyTok::Word(f)) if f == "text" => csv = false,
+                Some(CopyTok::Word(f)) if f == "csv" => csv = true,
+                _ => return Err(bad("FORMAT: só text ou csv (sem BINARY)")),
             },
-            "delimiter" | "null" => {
+            // Forma antiga, sem parênteses: `CSV [HEADER]`.
+            "csv" if !paren => csv = true,
+            "header" => {
+                let v = it.next_if(|t| copy_bool(t).is_some());
+                header = Some(v.as_ref().and_then(copy_bool).unwrap_or(true));
+            }
+            "delimiter" | "null" | "quote" | "escape" => {
                 let _ = it.next_if(|t| matches!(t, CopyTok::Word(w) if w == "as"));
                 let Some(CopyTok::Str(v)) = it.next() else {
-                    return Err(bad("DELIMITER/NULL querem um texto"));
+                    return Err(bad(&format!("{} quer um texto", name.to_uppercase())));
                 };
                 match name.as_str() {
                     "delimiter" => delim = Some(v),
-                    _ => null = Some(v),
+                    "null" => null = Some(v),
+                    "quote" => quote = Some(v),
+                    _ => escape = Some(v),
                 }
             }
             _ => return Err(Error::Sql(format!("COPY: opção {name} não suportada"))),
@@ -1002,16 +1037,37 @@ fn parse_copy_opts(toks: Vec<CopyTok>) -> Result<CopyOpts> {
     if !closed || it.next().is_some() {
         return Err(bad("opções mal formadas"));
     }
-    let delim = match delim {
-        None => b'\t',
-        Some(s) if s.len() == 1 && s.is_ascii() => s.as_bytes()[0],
-        Some(_) => return Err(bad("DELIMITER: um caractere ASCII")),
-    };
-    if matches!(delim, b'\n' | b'\r' | b'\\') {
+    if !csv && (header.is_some() || quote.is_some() || escape.is_some()) {
+        return Err(bad("HEADER, QUOTE e ESCAPE só valem com FORMAT csv"));
+    }
+    let default_delim = if csv { b',' } else { b'\t' };
+    let delim = one_char(delim, default_delim, "DELIMITER")?;
+    if matches!(delim, b'\n' | b'\r') || (!csv && delim == b'\\') {
         return Err(bad("DELIMITER inválido"));
     }
-    let null = null.unwrap_or_else(|| "\\N".to_string());
-    Ok(CopyOpts { delim, null })
+    let quote = one_char(quote, b'"', "QUOTE")?;
+    let escape = one_char(escape, quote, "ESCAPE")?;
+    let default_null = if csv { "" } else { "\\N" };
+    let null = null.unwrap_or_else(|| default_null.to_string());
+    if csv {
+        if quote == delim {
+            return Err(bad("DELIMITER e QUOTE precisam ser diferentes"));
+        }
+        if matches!(quote, b'\n' | b'\r') || matches!(escape, b'\n' | b'\r') {
+            return Err(bad("QUOTE/ESCAPE inválido"));
+        }
+        if null.bytes().any(|b| b == delim || b == quote) {
+            return Err(bad("NULL não pode conter o delimitador nem a aspa"));
+        }
+    }
+    Ok(CopyOpts {
+        delim,
+        null,
+        csv,
+        header: header.unwrap_or(false),
+        quote,
+        escape,
+    })
 }
 
 /// `COPY tabela [(colunas)] FROM STDIN|TO STDOUT [opções]` e `COPY (consulta) TO STDOUT`.
@@ -1093,11 +1149,31 @@ fn copy_line(fields: &[Option<String>], opts: &CopyOpts) -> Vec<u8> {
         }
         match field {
             None => out.extend_from_slice(opts.null.as_bytes()),
+            Some(s) if opts.csv => csv_field(s, opts, &mut out),
             Some(s) => text_field(s, opts.delim, &mut out),
         }
     }
     out.push(b'\n');
     out
+}
+
+/// Campo CSV: vai entre aspas se tiver delimitador, aspa, `\r` ou `\n`, se for vazio, igual
+/// ao NULL ou `\.` (que encerraria os dados); dentro das aspas, aspa e ESCAPE ganham ESCAPE.
+fn csv_field(s: &str, opts: &CopyOpts, out: &mut Vec<u8>) {
+    let special = |b: u8| b == opts.delim || b == opts.quote || b == b'\n' || b == b'\r';
+    let quoted = s.is_empty() || s == opts.null || s == "\\." || s.bytes().any(special);
+    if !quoted {
+        out.extend_from_slice(s.as_bytes());
+        return;
+    }
+    out.push(opts.quote);
+    for b in s.bytes() {
+        if b == opts.quote || b == opts.escape {
+            out.push(opts.escape);
+        }
+        out.push(b);
+    }
+    out.push(opts.quote);
 }
 
 /// Inverso de `text_field`: escapes, octal (`\101`) e hexadecimal (`\x41`).
@@ -1167,6 +1243,17 @@ impl CopyRows<'_> {
             return Ok(None);
         }
         self.line += 1;
+        if self.opts.csv {
+            let fields = self.csv_fields()?;
+            // HEADER: a 1ª linha (nomes das colunas) é descartada sem conferir.
+            if self.opts.header && self.line == 1 {
+                return self.next_row(width);
+            }
+            if fields.len() != width {
+                return Err(width_error(self.line, width, fields.len()));
+            }
+            return Ok(Some(fields));
+        }
         let nl = rest.iter().position(|&b| b == b'\n');
         let end = nl.unwrap_or(rest.len());
         self.pos += (end + 1).min(rest.len());
@@ -1188,9 +1275,7 @@ impl CopyRows<'_> {
         }
         raw.push(&line[start..]);
         if raw.len() != width {
-            let (n, got) = (self.line, raw.len());
-            let msg = format!("linha {n}: esperava {width} coluna(s), veio {got}");
-            return Err(bad(&msg));
+            return Err(width_error(self.line, width, raw.len()));
         }
         let null = self.opts.null.as_bytes();
         let mut fields = Vec::with_capacity(width);
@@ -1203,9 +1288,73 @@ impl CopyRows<'_> {
         }
         Ok(Some(fields))
     }
+
+    /// Um registro CSV a partir de `self.pos`: as aspas protegem delimitador, quebras de
+    /// linha e a própria aspa (dobrada ou após o ESCAPE). Só o NULL sem aspas é NULL.
+    fn csv_fields(&mut self) -> Result<Fields> {
+        let (data, o) = (self.data, self.opts);
+        let mut fields = Vec::new();
+        let mut i = self.pos;
+        loop {
+            let mut buf = Vec::new();
+            let (mut quoted, mut inside) = (false, false);
+            // Lê um campo; `true` quando a linha (o registro) acabou.
+            let last = loop {
+                let Some(&c) = data.get(i) else {
+                    if inside {
+                        let msg = format!("linha {}: aspas sem fechamento", self.line);
+                        return Err(bad(&msg));
+                    }
+                    break true;
+                };
+                i += 1;
+                if inside {
+                    let next = data.get(i).copied();
+                    if c == o.escape && (next == Some(o.quote) || next == Some(o.escape)) {
+                        buf.push(data[i]);
+                        i += 1;
+                    } else if c == o.quote {
+                        inside = false;
+                    } else {
+                        buf.push(c);
+                    }
+                } else if c == o.delim {
+                    break false;
+                } else if c == b'\n' {
+                    break true;
+                } else if c == b'\r' && matches!(data.get(i), None | Some(b'\n')) {
+                    i = (i + 1).min(data.len());
+                    break true;
+                } else if c == o.quote {
+                    quoted = true;
+                    inside = true;
+                } else {
+                    buf.push(c);
+                }
+            };
+            let field = if !quoted && buf == o.null.as_bytes() {
+                None
+            } else {
+                let s = String::from_utf8(buf).map_err(|_| bad("dados não são UTF-8 válido"))?;
+                Some(s)
+            };
+            fields.push(field);
+            if last {
+                self.pos = i;
+                return Ok(fields);
+            }
+        }
+    }
 }
 
-/// `CopyInResponse` ('G') ou `CopyOutResponse` ('H'): formato texto em todas as colunas.
+/// Linha com número de colunas diferente do esperado.
+fn width_error(line: usize, width: usize, got: usize) -> Error {
+    let msg = format!("linha {line}: esperava {width} coluna(s), veio {got}");
+    bad(&msg)
+}
+
+/// `CopyInResponse` ('G') ou `CopyOutResponse` ('H'): formato texto em todas as colunas
+/// (o CSV também é 0, como no PostgreSQL).
 fn copy_response(w: &mut impl Write, ty: u8, width: usize) -> Result<()> {
     let mut body = vec![0u8];
     body.extend_from_slice(&(width as u16).to_be_bytes());
@@ -1410,6 +1559,10 @@ impl Conn<'_> {
             return Err(bad("a consulta não devolve linhas"));
         };
         copy_response(ch, b'H', columns.len())?;
+        if spec.opts.header {
+            let names: Fields = columns.iter().cloned().map(Some).collect();
+            send(ch, b'd', &copy_line(&names, &spec.opts))?;
+        }
         for row in &rows {
             let fields: Fields = row.iter().map(text_of).collect();
             send(ch, b'd', &copy_line(&fields, &spec.opts))?;
@@ -1709,5 +1862,58 @@ mod tests {
             value_from_binary(OID_FLOAT8, &1.5f64.to_be_bytes()).unwrap(),
             Value::Real(1.5)
         );
+    }
+
+    #[test]
+    fn copy_csv_options_and_fields() {
+        let opts = |sql: &str| parse_copy_opts(copy_tokens(sql).unwrap());
+        let s = |v: &str| Some(v.to_string());
+        let o = opts("WITH (FORMAT csv, HEADER true, DELIMITER ';')").unwrap();
+        assert!(o.csv && o.header && o.null.is_empty());
+        assert_eq!((o.delim, o.quote, o.escape), (b';', b'"', b'"'));
+        let o = opts("WITH CSV HEADER").unwrap();
+        assert!(o.csv && o.header && o.delim == b',');
+        assert!(!opts("(FORMAT csv, HEADER off)").unwrap().header);
+        for wrong in [
+            "(FORMAT binary)",
+            "(FORMAT csv, DELIMITER ';;')",
+            "(FORMAT csv, DELIMITER '\"')",
+            "(FORMAT csv, NULL ',')",
+            "(FORMAT csv, QUOTE 'xy')",
+            "(FORMAT text, HEADER)",
+            "(FORMAT csv, FORCE_QUOTE x)",
+        ] {
+            assert!(opts(wrong).is_err(), "{wrong}");
+        }
+
+        // Ida e volta: vírgula, aspa, quebra de linha, vazio e NULL.
+        let o = opts("(FORMAT csv)").unwrap();
+        let fields = vec![s("a,b"), s("x\"y"), s("1\n2"), s(""), None];
+        let line = copy_line(&fields, &o);
+        assert_eq!(line, b"\"a,b\",\"x\"\"y\",\"1\n2\",\"\",\n");
+        assert_eq!(copy_line(&[s("\\.")], &o), b"\"\\.\"\n");
+        let mut rows = CopyRows {
+            data: &line,
+            pos: 0,
+            line: 0,
+            opts: &o,
+        };
+        assert_eq!(rows.next_row(5).unwrap(), Some(fields));
+        assert_eq!(rows.next_row(5).unwrap(), None);
+
+        // ESCAPE próprio, NULL entre aspas é texto e aspas sem fechamento.
+        let o = opts("(FORMAT csv, ESCAPE '\\', NULL 'N')").unwrap();
+        let mut rows = CopyRows {
+            data: b"\"a\\\"b\",N,\"N\",\n\"aberta,x\n",
+            pos: 0,
+            line: 0,
+            opts: &o,
+        };
+        assert_eq!(
+            rows.next_row(4).unwrap(),
+            Some(vec![s("a\"b"), None, s("N"), s("")])
+        );
+        let err = rows.next_row(4).unwrap_err().to_string();
+        assert!(err.contains("linha 2"), "{err}");
     }
 }

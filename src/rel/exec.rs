@@ -1453,7 +1453,7 @@ pub(super) fn arith(a: Value, op: BinOp, b: Value) -> Result<Value> {
     })
 }
 
-fn truth(v: Option<bool>) -> Value {
+pub(super) fn truth(v: Option<bool>) -> Value {
     v.map_or(Value::Null, Value::Bool)
 }
 
@@ -2109,6 +2109,7 @@ pub(super) struct Exec<'a> {
     analyze: Cell<bool>,
     notes: RefCell<Vec<String>>,
     fts: RefCell<FtsCache>,
+    vm_cache: RefCell<HashMap<usize, Option<Rc<super::vm::Program>>>>,
 }
 
 impl<'a> Exec<'a> {
@@ -2129,6 +2130,7 @@ impl<'a> Exec<'a> {
             analyze: Cell::new(false),
             notes: RefCell::default(),
             fts: RefCell::default(),
+            vm_cache: RefCell::default(),
         }
     }
 
@@ -2357,7 +2359,50 @@ impl<'a> Exec<'a> {
         Ok(acc)
     }
 
+    fn eval_vm(&self, e: &Expr, ctx: &Ctx<'_>) -> Result<Value> {
+        let key = e as *const Expr as usize;
+        let prog = {
+            let mut cache = self.vm_cache.borrow_mut();
+            if let Some(cached) = cache.get(&key) {
+                cached.clone()
+            } else {
+                let compiled = super::vm::compile(e).ok().map(Rc::new);
+                cache.insert(key, compiled.clone());
+                compiled
+            }
+        };
+
+        if let Some(prog) = prog {
+            super::vm::execute(&prog, self.params, |tbl, name| {
+                self.column(ctx, tbl, name)
+            })
+        } else {
+            self.eval_fallback(e, ctx)
+        }
+    }
+
     pub(super) fn eval(&self, e: &Expr, ctx: &Ctx<'_>) -> Result<Value> {
+        match e {
+            Expr::Lit(v) => return Ok(v.clone()),
+            Expr::Param(i) => {
+                return self
+                    .params
+                    .get(*i)
+                    .cloned()
+                    .ok_or_else(|| Error::Sql(format!("parâmetro {} não informado", i + 1)));
+            }
+            Expr::Col(t, name) => return self.column(ctx, t.as_deref(), name),
+            _ => {}
+        }
+
+        if super::vm::can_compile(e) {
+            return self.eval_vm(e, ctx);
+        }
+
+        self.eval_fallback(e, ctx)
+    }
+
+    fn eval_fallback(&self, e: &Expr, ctx: &Ctx<'_>) -> Result<Value> {
         if let Expr::Bin(first, _, _) = e {
             if matches!(**first, Expr::Bin(..)) {
                 return self.eval_chain(e, ctx);
@@ -2846,6 +2891,20 @@ impl<'a> Exec<'a> {
                 ))),
             })
             .collect::<Result<Vec<_>>>()?;
+        if out.rows.len() > 50_000 {
+            let temp_dir = std::env::temp_dir();
+            let mut sorter = super::extsort::ExternalSorter::new(temp_dir, 50_000, order_by.to_vec());
+            for r in std::mem::take(&mut out.rows) {
+                let k: Vec<Value> = positions.iter().map(|&p| r[p].clone()).collect();
+                sorter.push(k, r)?;
+            }
+            let mut iter = sorter.finish()?;
+            while let Some(entry) = iter.next_entry()? {
+                out.rows.push(entry.row);
+            }
+            return Ok(());
+        }
+
         out.rows.sort_by(|a, b| {
             let ka: Vec<Value> = positions.iter().map(|&p| a[p].clone()).collect();
             let kb: Vec<Value> = positions.iter().map(|&p| b[p].clone()).collect();
@@ -3560,6 +3619,138 @@ impl<'a> Exec<'a> {
         hash.unwrap_or(JoinPlan::Nested)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn grace_hash_join(
+        &self,
+        outer_rows: Vec<Vec<Value>>,
+        all_inner: &[Vec<Value>],
+        inner_expr: &Expr,
+        outer_expr: &Expr,
+        inner_scope: &Scope,
+        partial_scope: &Scope,
+        combined_scope: &Scope,
+        outer: Option<&Ctx<'_>>,
+        j: &super::parser::Join,
+        inner_width: usize,
+        width: usize,
+    ) -> Result<Vec<Vec<Value>>> {
+        const BUCKETS: usize = 16;
+        let temp_dir = std::env::temp_dir();
+        let pid = std::process::id();
+        self.note(format!(
+            "GRACE HASH JOIN (partitioned spill: inner_rows={} outer_rows={})",
+            all_inner.len(),
+            outer_rows.len()
+        ));
+
+        let mut inner_writers: Vec<super::extsort::PartitionWriter> = Vec::with_capacity(BUCKETS);
+        let mut outer_writers: Vec<super::extsort::PartitionWriter> = Vec::with_capacity(BUCKETS);
+        for b in 0..BUCKETS {
+            let in_path = temp_dir.join(format!("minidb_ghj_in_{}_{}_{}.tmp", pid, b, self.trigger_depth));
+            let out_path = temp_dir.join(format!("minidb_ghj_out_{}_{}_{}.tmp", pid, b, self.trigger_depth));
+            inner_writers.push(super::extsort::PartitionRun::create(in_path)?);
+            outer_writers.push(super::extsort::PartitionRun::create(out_path)?);
+        }
+
+        let mut next = Vec::new();
+        let needs_all_inner = matches!(j.kind, JoinKind::Right | JoinKind::Full);
+
+        // 1. Particiona a relação interna
+        for r in all_inner {
+            let v = self.eval(inner_expr, &Ctx::new(inner_scope, r, outer))?;
+            if !v.is_null() {
+                let hk = hash_key(&v);
+                let b = (super::cbo::Hll::hash64(&hk) as usize) % BUCKETS;
+                inner_writers[b].write_row(r)?;
+            } else if needs_all_inner {
+                let mut row = vec![Value::Null; width];
+                row.extend(r.clone());
+                next.push(row);
+            }
+        }
+
+        // 2. Particiona a relação externa
+        for r in outer_rows {
+            let v = self.eval(outer_expr, &Ctx::new(partial_scope, &r, outer))?;
+            if !v.is_null() {
+                let hk = hash_key(&v);
+                let b = (super::cbo::Hll::hash64(&hk) as usize) % BUCKETS;
+                outer_writers[b].write_row(&r)?;
+            } else if matches!(j.kind, JoinKind::Left | JoinKind::Full) {
+                let mut row = r;
+                row.extend(std::iter::repeat_n(Value::Null, inner_width));
+                next.push(row);
+            }
+        }
+
+        let inner_runs: Vec<super::extsort::PartitionRun> = inner_writers
+            .into_iter()
+            .map(|w| w.finish())
+            .collect::<Result<Vec<_>>>()?;
+        let outer_runs: Vec<super::extsort::PartitionRun> = outer_writers
+            .into_iter()
+            .map(|w| w.finish())
+            .collect::<Result<Vec<_>>>()?;
+
+        // 3. Junta cada partição de forma isolada na RAM
+        for b in 0..BUCKETS {
+            if inner_runs[b].count == 0 && outer_runs[b].count == 0 {
+                continue;
+            }
+
+            let mut b_inner = Vec::with_capacity(inner_runs[b].count);
+            let mut inner_reader = inner_runs[b].open_reader()?;
+            while let Some(r) = inner_reader.next_row()? {
+                b_inner.push(r);
+            }
+
+            let mut b_hash: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+            for (i, r) in b_inner.iter().enumerate() {
+                let v = self.eval(inner_expr, &Ctx::new(inner_scope, r, outer))?;
+                if !v.is_null() {
+                    b_hash.entry(hash_key(&v)).or_default().push(i);
+                }
+            }
+
+            let mut matched_inner = vec![false; b_inner.len()];
+            let mut outer_reader = outer_runs[b].open_reader()?;
+            while let Some(outer_row) = outer_reader.next_row()? {
+                let v = self.eval(outer_expr, &Ctx::new(partial_scope, &outer_row, outer))?;
+                let mut matched = false;
+                if !v.is_null() {
+                    if let Some(indices) = b_hash.get(&hash_key(&v)) {
+                        for &i in indices {
+                            let mut row = outer_row.clone();
+                            row.extend(b_inner[i].clone());
+                            if self.is_true(j.on.as_ref(), &Ctx::new(combined_scope, &row, outer))? {
+                                matched = true;
+                                matched_inner[i] = true;
+                                next.push(row);
+                            }
+                        }
+                    }
+                }
+                if !matched && matches!(j.kind, JoinKind::Left | JoinKind::Full) {
+                    let mut row = outer_row;
+                    row.extend(std::iter::repeat_n(Value::Null, inner_width));
+                    next.push(row);
+                }
+            }
+
+            if needs_all_inner {
+                for (i, inner_row) in b_inner.into_iter().enumerate() {
+                    if !matched_inner[i] {
+                        let mut row = vec![Value::Null; width];
+                        row.extend(inner_row);
+                        next.push(row);
+                    }
+                }
+            }
+        }
+
+        Ok(next)
+    }
+
     fn select(
         &self,
         s: &Select,
@@ -3821,6 +4012,26 @@ impl<'a> Exec<'a> {
             };
             let mut inner_scope = Scope::default();
             inner_scope.add(&j.item.alias, &rel.names());
+            if let (JoinPlan::Hash { inner, outer: oe }, Some(all)) = (plan, &materialized) {
+                if all.len() > 50_000 || rows.len() > 50_000 {
+                    rows = self.grace_hash_join(
+                        rows,
+                        all,
+                        inner,
+                        oe,
+                        &inner_scope,
+                        &partial,
+                        &combined,
+                        outer,
+                        j,
+                        inner_width,
+                        width,
+                    )?;
+                    width += rel.width();
+                    continue;
+                }
+            }
+
             let hash: Option<HashMap<Vec<u8>, Vec<usize>>> = match (plan, &materialized) {
                 (JoinPlan::Hash { inner, .. }, Some(all)) => {
                     let mut map: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
@@ -4161,6 +4372,29 @@ impl<'a> Exec<'a> {
                     output.truncate(n);
                     output.sort_by(|(a, _), (b, _)| cmp_order(a, b, order_by));
                     self.note(format!("TOP-N sort keep={n}"));
+                }
+                _ if output.len() > 50_000 => {
+                    let temp_dir = std::env::temp_dir();
+                    let mut sorter = super::extsort::ExternalSorter::new(temp_dir, 50_000, order_by.to_vec());
+                    for (k, r) in output {
+                        sorter.push(k, r)?;
+                    }
+                    let mut iter = sorter.finish()?;
+                    let mut rows = Vec::new();
+                    let mut skipped = 0;
+                    let take_max = limit.unwrap_or(usize::MAX);
+                    while let Some(entry) = iter.next_entry()? {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        rows.push(entry.row);
+                        if rows.len() >= take_max {
+                            break;
+                        }
+                    }
+                    self.note(format!("EXTERNAL SORT rows={}", rows.len()));
+                    return Ok(Output { columns, rows });
                 }
                 _ => {
                     output.sort_by(|(a, _), (b, _)| cmp_order(a, b, order_by));
@@ -4525,7 +4759,7 @@ impl<'a> Exec<'a> {
 }
 
 /// Comparação SQL; `None` quando `op` não é de comparação.
-fn compare(a: &Value, op: BinOp, b: &Value) -> Option<Value> {
+pub(super) fn compare(a: &Value, op: BinOp, b: &Value) -> Option<Value> {
     let cmp = |f: fn(Ordering) -> bool| truth(a.sql_cmp(b).map(f));
     Some(match op {
         BinOp::Eq => cmp(|o| o == Ordering::Equal),
@@ -4562,7 +4796,7 @@ fn hash_key(v: &Value) -> Vec<u8> {
     }
 }
 
-fn in_list<'v>(x: &Value, values: impl Iterator<Item = &'v Value>, neg: bool) -> Value {
+pub(super) fn in_list<'v>(x: &Value, values: impl Iterator<Item = &'v Value>, neg: bool) -> Value {
     if x.is_null() {
         return Value::Null;
     }
@@ -4812,6 +5046,25 @@ pub(super) fn read(src: &dyn Source, stmt: &Stmt, params: &[Value]) -> Option<Re
                 columns: ["table", "index", "columns", "unique", "auto", "kind"]
                     .map(String::from)
                     .to_vec(),
+                rows,
+            })
+        })(),
+        Stmt::ShowCluster => (|| {
+            let mut rows = Vec::new();
+            if let Ok(Some(raw)) = src.get(crate::replication::CONFIG_KEY) {
+                let text = String::from_utf8_lossy(&raw);
+                if let Ok(m) = crate::raft::Membership::decode(&text) {
+                    for (id, addr) in m.members {
+                        rows.push(vec![
+                            Value::Int(id as i64),
+                            Value::Text(addr),
+                            Value::Int(m.index as i64),
+                        ]);
+                    }
+                }
+            }
+            Ok(ExecResult::Table {
+                columns: ["id", "addr", "config_index"].map(String::from).to_vec(),
                 rows,
             })
         })(),

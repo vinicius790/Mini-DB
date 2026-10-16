@@ -75,6 +75,8 @@ SHOW TABLES;                                 -- name, kind (table/view), columns
 SHOW INDEXES [FROM t];                       -- table, index, columns, unique, auto, kind
 SHOW CREATE TABLE t;  SHOW CREATE VIEW v;    -- DDL reexecutável
 DESCRIBE t;  SHOW COLUMNS FROM t;            -- column, type, pk, not_null, default, index, references
+SHOW CLUSTER;                                -- nós, ids, endereços, papel e estado do cluster Raft
+SHOW PEERS;                                  -- réplicas conectadas, LSN e latência de streaming
 EXPLAIN comando;
 ```
 
@@ -241,18 +243,30 @@ ela lê (bom para agregados de tabelas pequenas ou médias; para tabelas grandes
 
 ## Estatísticas e planejador
 
-`ANALYZE [tabela]` percorre a tabela e guarda linhas, distintos, nulos, mínimo e
-máximo por coluna. Com estatísticas o planejador estima as linhas de cada caminho
-(igualdade = linhas ÷ distintos; faixas por interpolação min/max) e escolhe o mais
-barato; `EXPLAIN` mostra `est. rows≈N`. Sem estatísticas vale a heurística "mais
-colunas de igualdade casadas". `EXPLAIN ANALYZE consulta` executa e mostra, por
-etapa, linhas lidas e devolvidas e o tempo. Estatísticas somem em `DROP COLUMN` e
+`ANALYZE [tabela]` percorre a tabela e calcula linhas, valores nulos, mínimo, máximo
+e a contagem de distintos via **HyperLogLog (HLL)** ($p=10$, 1024 registradores de
+1 byte, $\text{SE} \approx 3,25\%$, exatamente 1 KiB constante de RAM por coluna).
+Não há saturação nem risco de esgotamento de memória em grandes volumes de dados.
+Os sketches binários são gravados na chave reservada `0xFF, b'h', table_id, col_idx`,
+alimentando o Otimizador Baseado em Custo (CBO) para avaliar seletividades e o ponto
+de virada (*tipping point*) entre varredura sequencial e varredura por índice B+ Tree.
+`EXPLAIN ANALYZE consulta` executa e mostra, por etapa, linhas lidas e devolvidas,
+tempos e notas operacionais de execução. Estatísticas somem em `DROP COLUMN` e
 acompanham `RENAME TO`; rode `ANALYZE` de novo depois de grandes cargas.
 
-Ordenação: se o acesso já entrega na ordem pedida (chave primária, ou as colunas
-restantes de um índice usado por igualdade, seguidas da PK), não há sort; em ASC a
-consulta para no `LIMIT`. O planejador prefere um índice que forneça a ordem quando
-custa até o dobro do melhor. `ORDER BY ... LIMIT n` sem índice usa seleção Top-N.
+Expressões escalares puras, lógicas e aritméticas são compiladas automaticamente
+para uma **Máquina Virtual de Bytecode (VM)** plana e iterativa, executando sem
+recursão de pilha Rust (prevenindo *stack overflow*) e com curto-circuito em três
+valores (*three-valued logic*), com memoização transparente em cache por consulta.
+
+Ordenação e limites de memória: se o acesso já entrega na ordem pedida (chave
+primária ou colunas restantes de um índice), não há sort; em ASC a consulta para no
+`LIMIT`. `ORDER BY ... LIMIT n` com $n$ pequeno usa seleção Top-N em memória.
+Quando o conjunto de linhas ordenadas ultrapassa o limite de memória configurado
+(`max_in_memory_rows`, padrão 50.000 linhas), o motor executa **Ordenação Externa
+(External Merge Sort)** com *spill* progressivo para lotes temporários em disco
+(bufferizados a 64 KiB) e mesclagem streaming K-way (consumo constante $O(K)$ de RAM),
+garantindo ausência de OOM. O `EXPLAIN ANALYZE` anota `EXTERNAL SORT rows=N`.
 
 ## Notificações e mudanças
 

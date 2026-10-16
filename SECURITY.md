@@ -63,17 +63,17 @@ são ferramentas de desenvolvimento/integração, não uma fronteira de seguran�
 - **Criptografia em repouso** (1.0): com `passphrase` (`MINIDB_PASSPHRASE`) o banco novo
   cifra páginas (`data.mdb`, journal, spill) e frames do WAL/arquivo com ChaCha20; a
   chave vem de PBKDF2-HMAC-SHA256 (20 000 iterações) da senha e `data.mdb.key` guarda só
-  sal e verificador. Bancos criados a partir desta versão (`data.mdb.key` versão 2)
-  autenticam cada página com Poly1305 (adulteração ou troca de páginas dão `CorruptPage`)
-  e cada frame do WAL com ChaCha20-Poly1305 encadeado pelo LSN do frame anterior (frame
+  sal e verificador. Bancos criados a partir desta versão (`data.mdb.key` versão 3)
+  autenticam cada página com Poly1305 de 128 bits e guardam o nonce atual de cada
+  página num mapa autenticado (`data.mdb.pages`): adulteração, troca de páginas,
+  arquivo truncado e **versão antiga de uma página** (*replay*) dão `CorruptPage`. Cada
+  frame do WAL vai com ChaCha20-Poly1305 encadeado pelo LSN do frame anterior (frame
   alterado, removido, repetido ou fora de ordem dá `CorruptWal`; cortar o fim do WAL,
   como numa escrita interrompida, continua possível). O tipo e o LSN de cada registro do
-  WAL ficam em claro (autenticados). Bancos antigos (chave v1) seguem no formato
-  anterior, sem etiqueta nas páginas nem no WAL (o checksum só detecta corrupção
-  acidental), até um `encrypt`/`rekey`. Replay de uma versão antiga da mesma página (ou
-  do banco inteiro) não é detectado: exigiria a versão de cada página num lugar
-  autenticado e um contador fora do disco (ver `docs/RECOVERY.md`). Senha errada é
-  recusada na abertura. `minidb encrypt|decrypt|rekey [dir]` (senhas em `MINIDB_PASSPHRASE` /
+  WAL ficam em claro (autenticados). Bancos antigos (chave v1 ou v2) são migrados para
+  esse formato na primeira abertura com a senha, mantendo a chave (ver
+  `docs/RECOVERY.md`). Voltar o diretório inteiro a uma cópia anterior coerente não é
+  detectado: exigiria um contador fora do disco. Senha errada é recusada na abertura. `minidb encrypt|decrypt|rekey [dir]` (senhas em `MINIDB_PASSPHRASE` /
   `MINIDB_NEW_PASSPHRASE`) converte um banco fechado no lugar, reescrevendo as páginas
   após checkpoint (o WAL arquivado antigo é descartado). Se a conversão for
   interrompida, a abertura seguinte a desfaz (banco e chave originais) ou a conclui.

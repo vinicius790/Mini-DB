@@ -1,4 +1,4 @@
-//! Funções escalares do SQL: texto, matemática, condicionais, data/hora
+//! FunÃƒÂ§ÃƒÂµes escalares do SQL: texto, matemÃƒÂ¡tica, condicionais, data/hora
 //! (UTC, formato ISO 8601 ou segundos Unix), JSON e hash.
 
 use super::search::{self, Metric, TextQuery};
@@ -33,7 +33,7 @@ fn num(name: &str, v: &Value) -> Result<f64> {
             Value::Bool(b) => Some(*b as i64 as f64),
             _ => None,
         })
-        .ok_or_else(|| Error::Sql(format!("{name}() espera número, recebeu {}", v.type_name())))
+        .ok_or_else(|| Error::Sql(format!("{name}() espera nÃƒÂºmero, recebeu {}", v.type_name())))
 }
 
 thread_local! {
@@ -43,12 +43,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Usuário da sessão em execução nesta thread (`current_user`).
+/// UsuÃƒÂ¡rio da sessÃƒÂ£o em execuÃƒÂ§ÃƒÂ£o nesta thread (`current_user`).
 pub fn set_current_user(user: Option<String>) {
     CURRENT_USER.with(|u| *u.borrow_mut() = user);
 }
 
-/// Dados da conexão em execução nesta thread (`pg_stat_activity`, `pg_stat_ssl`,
+/// Dados da conexÃƒÂ£o em execuÃƒÂ§ÃƒÂ£o nesta thread (`pg_stat_activity`, `pg_stat_ssl`,
 /// `ssl_is_used()`...). Definidos pelo servidor PostgreSQL a cada consulta.
 #[derive(Clone, Debug, Default)]
 pub struct ConnInfo {
@@ -80,7 +80,7 @@ fn current_user() -> String {
     CURRENT_USER.with(|u| u.borrow().clone().unwrap_or_else(|| "minidb".into()))
 }
 
-/// Regex compilada com cache pequeno por thread (padrões repetem-se por linha).
+/// Regex compilada com cache pequeno por thread (padrÃƒÂµes repetem-se por linha).
 fn regex_for(pattern: &str, flags: &str) -> Result<super::regex::Regex> {
     REGEX_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
@@ -102,13 +102,13 @@ fn vector(v: &Value) -> Result<Vec<f32>> {
 
 fn real(x: f64) -> Result<Value> {
     if x.is_nan() {
-        return Err(Error::Sql("resultado numérico indefinido (NaN)".into()));
+        return Err(Error::Sql("resultado numÃƒÂ©rico indefinido (NaN)".into()));
     }
     Ok(Value::Real(x))
 }
 
-/// Chama a função escalar `name` (minúsculas) com os argumentos avaliados.
-/// Funções com NULL em argumento obrigatório devolvem NULL, como no SQL.
+/// Chama a funÃƒÂ§ÃƒÂ£o escalar `name` (minÃƒÂºsculas) com os argumentos avaliados.
+/// FunÃƒÂ§ÃƒÂµes com NULL em argumento obrigatÃƒÂ³rio devolvem NULL, como no SQL.
 pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
     let n = v.len();
     let arity = |min: usize, max: usize, usage: &str| {
@@ -118,7 +118,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             Ok(())
         }
     };
-    // Funções que tratam NULL de forma especial.
+    // FunÃƒÂ§ÃƒÂµes que tratam NULL de forma especial.
     match name {
         "coalesce" | "ifnull" | "nvl" => {
             return Ok(v.into_iter().find(|x| !x.is_null()).unwrap_or(Value::Null))
@@ -132,7 +132,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             });
         }
         "iif" | "if" => {
-            arity(2, 3, "condição, se_verdadeiro[, se_falso]")?;
+            arity(2, 3, "condiÃƒÂ§ÃƒÂ£o, se_verdadeiro[, se_falso]")?;
             let mut it = v.into_iter();
             let cond = it.next().expect("aridade");
             let yes = it.next().expect("aridade");
@@ -225,6 +225,63 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
                 &h[20..]
             )));
         }
+        "uuid7" | "uuid_v7" => {
+            arity(0, 0, "")?;
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(1);
+            let mut b = crate::crypto::random_bytes::<16>();
+            b[0] = (ms >> 40) as u8;
+            b[1] = (ms >> 32) as u8;
+            b[2] = (ms >> 24) as u8;
+            b[3] = (ms >> 16) as u8;
+            b[4] = (ms >> 8) as u8;
+            b[5] = ms as u8;
+            b[6] = (b[6] & 0x0f) | 0x70;
+            b[8] = (b[8] & 0x3f) | 0x80;
+            let h = hex(&b);
+            return Ok(Value::Text(format!(
+                "{}-{}-{}-{}-{}",
+                &h[..8],
+                &h[8..12],
+                &h[12..16],
+                &h[16..20],
+                &h[20..]
+            )));
+        }
+        "ulid" => {
+            arity(0, 0, "")?;
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(1);
+            let mut b = [0u8; 16];
+            b[0] = (ms >> 40) as u8;
+            b[1] = (ms >> 32) as u8;
+            b[2] = (ms >> 24) as u8;
+            b[3] = (ms >> 16) as u8;
+            b[4] = (ms >> 8) as u8;
+            b[5] = ms as u8;
+            b[6..].copy_from_slice(&crate::crypto::random_bytes::<10>());
+            const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+            let mut s = String::with_capacity(26);
+            let get_5bits = |b: &[u8; 16], bit_offset: usize| -> usize {
+                let byte_idx = bit_offset / 8;
+                let bit_rem = bit_offset % 8;
+                let b0 = b[byte_idx] as u32;
+                let b1 = if byte_idx + 1 < 16 { b[byte_idx + 1] as u32 } else { 0 };
+                let combined = (b0 << 8) | b1;
+                let shifted = combined >> (11 - bit_rem);
+                (shifted & 0x1f) as usize
+            };
+            s.push(CROCKFORD[(b[0] >> 5) as usize] as char);
+            for i in 0..25 {
+                let val = get_5bits(&b, 3 + i * 5);
+                s.push(CROCKFORD[val] as char);
+            }
+            return Ok(Value::Text(s));
+        },
         "pi" => {
             arity(0, 0, "")?;
             return Ok(Value::Real(std::f64::consts::PI));
@@ -266,7 +323,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         _ => {}
     }
     if v.iter().any(Value::is_null) {
-        // Todas as funções abaixo são estritas em NULL.
+        // Todas as funÃƒÂ§ÃƒÂµes abaixo sÃƒÂ£o estritas em NULL.
         return Ok(Value::Null);
     }
     let a = |i: usize| &v[i];
@@ -338,14 +395,14 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             )
         }
         "substr" | "substring" | "mid" => {
-            arity(2, 3, "texto, início[, tamanho]")?;
+            arity(2, 3, "texto, inÃƒÂ­cio[, tamanho]")?;
             let s: Vec<char> = text(a(0)).chars().collect();
             let start = int(name, a(1))?;
             let len = match v.get(2) {
                 Some(l) => int(name, l)?,
                 None => i64::MAX,
             };
-            // Semântica do SQLite: início 1-based; negativo conta do fim.
+            // SemÃƒÂ¢ntica do SQLite: inÃƒÂ­cio 1-based; negativo conta do fim.
             let (from, len) = if start > 0 {
                 (start - 1, len)
             } else if start == 0 {
@@ -441,7 +498,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             } else if k < 0 {
                 (parts.len() as i64 + k).max(0) as usize
             } else {
-                return Err(Error::Sql("split_part(): n começa em 1".into()));
+                return Err(Error::Sql("split_part(): n comeÃƒÂ§a em 1".into()));
             };
             Value::Text(parts.get(idx).copied().unwrap_or("").to_string())
         }
@@ -451,7 +508,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
                 .map(|x| {
                     int(name, x).and_then(|c| {
                         char::from_u32(c as u32)
-                            .ok_or_else(|| Error::Sql(format!("char({c}) inválido")))
+                            .ok_or_else(|| Error::Sql(format!("char({c}) invÃƒÂ¡lido")))
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -488,19 +545,19 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             arity(
                 2,
                 if name == "vec_distance" { 3 } else { 2 },
-                "a, b[, métrica]",
+                "a, b[, mÃƒÂ©trica]",
             )?;
             let metric = match name {
                 "vec_l2" => Metric::L2,
                 "vec_dot" => Metric::Dot,
                 "vec_distance" if n == 3 => Metric::parse(&text(a(2)))
-                    .ok_or_else(|| Error::Sql(format!("métrica {} desconhecida", a(2))))?,
+                    .ok_or_else(|| Error::Sql(format!("mÃƒÂ©trica {} desconhecida", a(2))))?,
                 _ => Metric::Cosine,
             };
             let (x, y) = (vector(a(0))?, vector(a(1))?);
             if x.len() != y.len() {
                 return Err(Error::Sql(format!(
-                    "vetores de dimensões diferentes ({} e {})",
+                    "vetores de dimensÃƒÂµes diferentes ({} e {})",
                     x.len(),
                     y.len()
                 )));
@@ -536,13 +593,13 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             arity(2, 2, "a, b")?;
             let (x, y) = (vector(a(0))?, vector(a(1))?);
             if x.len() != y.len() {
-                return Err(Error::Sql("vetores de dimensões diferentes".into()));
+                return Err(Error::Sql("vetores de dimensÃƒÂµes diferentes".into()));
             }
             let sign = if name == "vec_add" { 1.0 } else { -1.0 };
             let out: Vec<f32> = x.iter().zip(&y).map(|(p, q)| p + sign * q).collect();
             Value::Text(search::vector_text(&out))
         }
-        // --- Espaço ---
+        // --- EspaÃƒÂ§o ---
         "st_distance" => {
             arity(4, 4, "x1, y1, x2, y2")?;
             let p: Vec<f64> = (0..4).map(|i| num(name, a(i))).collect::<Result<_>>()?;
@@ -582,21 +639,21 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
                 &close,
             ))
         }
-        // --- Expressões regulares ---
+        // --- ExpressÃƒÂµes regulares ---
         "regexp_like" | "regexp" | "regexp_match_op" => {
-            arity(2, 3, "texto, padrão[, flags]")?;
+            arity(2, 3, "texto, padrÃƒÂ£o[, flags]")?;
             let flags = if n > 2 { text(a(2)) } else { String::new() };
             let re = regex_for(&text(a(1)), &flags)?;
             Value::Bool(re.is_match(&text(a(0))))
         }
         "regexp_replace" => {
-            arity(3, 4, "texto, padrão, substituto[, flags]")?;
+            arity(3, 4, "texto, padrÃƒÂ£o, substituto[, flags]")?;
             let flags = if n > 3 { text(a(3)) } else { String::new() };
             let re = regex_for(&text(a(1)), &flags)?;
             Value::Text(re.replace(&text(a(0)), &text(a(2)), flags.contains('g')))
         }
         "regexp_substr" | "regexp_extract" => {
-            arity(2, 4, "texto, padrão[, posição, grupo]")?;
+            arity(2, 4, "texto, padrÃƒÂ£o[, posiÃƒÂ§ÃƒÂ£o, grupo]")?;
             let re = regex_for(&text(a(1)), "")?;
             let s = text(a(0));
             let chars: Vec<char> = s.chars().collect();
@@ -610,13 +667,13 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             }
         }
         "regexp_count" => {
-            arity(2, 3, "texto, padrão[, flags]")?;
+            arity(2, 3, "texto, padrÃƒÂ£o[, flags]")?;
             let flags = if n > 2 { text(a(2)) } else { String::new() };
             let re = regex_for(&text(a(1)), &flags)?;
             Value::Int(re.find_all(&text(a(0))).len() as i64)
         }
         "regexp_matches" | "regexp_split_to_array" => {
-            arity(2, 3, "texto, padrão[, flags]")?;
+            arity(2, 3, "texto, padrÃƒÂ£o[, flags]")?;
             let flags = if n > 2 { text(a(2)) } else { String::new() };
             let re = regex_for(&text(a(1)), &flags)?;
             let s = text(a(0));
@@ -638,7 +695,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             };
             Value::Text(Json::Array(items).stringify())
         }
-        // --- Compatibilidade PostgreSQL (sessão e catálogo) ---
+        // --- Compatibilidade PostgreSQL (sessÃƒÂ£o e catÃƒÂ¡logo) ---
         "version" => Value::Text("PostgreSQL 16.0 (Mini-DB 1.3.0)".into()),
         "current_database" | "current_catalog" => Value::Text("minidb".into()),
         "current_schema" => Value::Text("public".into()),
@@ -685,7 +742,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         | "has_server_privilege"
         | "has_foreign_data_wrapper_privilege" => Value::Bool(true),
         "pg_relation_is_publishable" | "pg_is_other_temp_schema" => Value::Bool(false),
-        // sem partições: nenhum ancestral (a linha NULL não casa com nada em IN)
+        // sem partiÃƒÂ§ÃƒÂµes: nenhum ancestral (a linha NULL nÃƒÂ£o casa com nada em IN)
         "pg_partition_ancestors" | "pg_partition_root" => Value::Null,
         "pg_size_pretty" => {
             arity(1, 1, "bytes")?;
@@ -742,7 +799,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             Value::Bool(items.contains(&n))
         }
         "array_get" => {
-            arity(2, 2, "array, índice")?;
+            arity(2, 2, "array, ÃƒÂ­ndice")?;
             let idx = int(name, a(1))?;
             match a(0) {
                 Value::Null => Value::Null,
@@ -763,7 +820,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
                             .map(|x| x.trim_matches('"').to_string())
                             .collect(),
                     };
-                    // Arrays do PostgreSQL começam em 1.
+                    // Arrays do PostgreSQL comeÃƒÂ§am em 1.
                     match idx
                         .checked_sub(1)
                         .and_then(|i| usize::try_from(i).ok())
@@ -906,7 +963,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
                 "use MATCH (colunas) AGAINST ('consulta') para busca textual".into(),
             ))
         }
-        // --- matemática ---
+        // --- matemÃƒÂ¡tica ---
         "abs" => {
             arity(1, 1, "x")?;
             match a(0) {
@@ -1017,7 +1074,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             arity(2, 2, "y, x")?;
             real(num(name, a(0))?.atan2(num(name, a(1))?))?
         }
-        // --- conversão ---
+        // --- conversÃƒÂ£o ---
         "to_number" | "tonumber" => {
             arity(1, 1, "texto")?;
             let s = text(a(0));
@@ -1044,7 +1101,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             let secs = match rest.first() {
                 None => now_secs(),
                 Some(x) => parse_datetime(x)
-                    .ok_or_else(|| Error::Sql(format!("data/hora inválida: {x}")))?,
+                    .ok_or_else(|| Error::Sql(format!("data/hora invÃƒÂ¡lida: {x}")))?,
             };
             let mut secs = secs;
             for m in rest.iter().skip(1) {
@@ -1063,7 +1120,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         | "dayofyear" | "quarter" => {
             arity(1, 1, "momento")?;
             let secs = parse_datetime(a(0))
-                .ok_or_else(|| Error::Sql(format!("data/hora inválida: {}", a(0))))?;
+                .ok_or_else(|| Error::Sql(format!("data/hora invÃƒÂ¡lida: {}", a(0))))?;
             let c = civil(secs);
             Value::Int(match name {
                 "year" => c.year,
@@ -1080,7 +1137,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         "date_add" | "dateadd" | "date_sub" | "datesub" => {
             arity(2, 2, "momento, modificador ('+1 day')")?;
             let secs = parse_datetime(a(0))
-                .ok_or_else(|| Error::Sql(format!("data/hora inválida: {}", a(0))))?;
+                .ok_or_else(|| Error::Sql(format!("data/hora invÃƒÂ¡lida: {}", a(0))))?;
             let m = text(a(1));
             let m = if name.ends_with("sub") {
                 flip_sign(&m)
@@ -1092,9 +1149,9 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         "date_diff" | "datediff" => {
             arity(2, 3, "a, b[, unidade]")?;
             let x = parse_datetime(a(0))
-                .ok_or_else(|| Error::Sql(format!("data/hora inválida: {}", a(0))))?;
+                .ok_or_else(|| Error::Sql(format!("data/hora invÃƒÂ¡lida: {}", a(0))))?;
             let y = parse_datetime(a(1))
-                .ok_or_else(|| Error::Sql(format!("data/hora inválida: {}", a(1))))?;
+                .ok_or_else(|| Error::Sql(format!("data/hora invÃƒÂ¡lida: {}", a(1))))?;
             let unit = v.get(2).map(text).unwrap_or_else(|| "day".into());
             let div = match unit.trim_end_matches('s') {
                 "second" | "sec" => 1,
@@ -1113,7 +1170,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         "json_extract" | "json_value" | "json_query" => {
             arity(2, 2, "json, caminho ('$.a.b[0]')")?;
             let doc =
-                Json::parse(&text(a(0))).map_err(|e| Error::Sql(format!("JSON inválido: {e}")))?;
+                Json::parse(&text(a(0))).map_err(|e| Error::Sql(format!("JSON invÃƒÂ¡lido: {e}")))?;
             match json_path(&doc, &text(a(1)))? {
                 None => Value::Null,
                 Some(j) => from_json(j),
@@ -1122,7 +1179,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         "json_type" => {
             arity(1, 2, "json[, caminho]")?;
             let doc =
-                Json::parse(&text(a(0))).map_err(|e| Error::Sql(format!("JSON inválido: {e}")))?;
+                Json::parse(&text(a(0))).map_err(|e| Error::Sql(format!("JSON invÃƒÂ¡lido: {e}")))?;
             let node = match v.get(1) {
                 Some(p) => json_path(&doc, &text(p))?,
                 None => Some(&doc),
@@ -1147,7 +1204,7 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
         "json_array_length" => {
             arity(1, 2, "json[, caminho]")?;
             let doc =
-                Json::parse(&text(a(0))).map_err(|e| Error::Sql(format!("JSON inválido: {e}")))?;
+                Json::parse(&text(a(0))).map_err(|e| Error::Sql(format!("JSON invÃƒÂ¡lido: {e}")))?;
             let node = match v.get(1) {
                 Some(p) => json_path(&doc, &text(p))?,
                 None => Some(&doc),
@@ -1162,11 +1219,11 @@ pub fn call(name: &str, v: Vec<Value>) -> Result<Value> {
             arity(1, 1, "json")?;
             Value::Text(
                 Json::parse(&text(a(0)))
-                    .map_err(|e| Error::Sql(format!("JSON inválido: {e}")))?
+                    .map_err(|e| Error::Sql(format!("JSON invÃƒÂ¡lido: {e}")))?
                     .stringify(),
             )
         }
-        _ => return Err(Error::Sql(format!("função desconhecida {name}()"))),
+        _ => return Err(Error::Sql(format!("funÃƒÂ§ÃƒÂ£o desconhecida {name}()"))),
     })
 }
 
@@ -1185,7 +1242,7 @@ fn flip_sign(m: &str) -> String {
     }
 }
 
-/// `printf` mínimo: `%s`, `%d`, `%i`, `%f`, `%.Nf`, `%x`, `%%`, `%Nd`, `%-Ns`.
+/// `printf` mÃƒÂ­nimo: `%s`, `%d`, `%i`, `%f`, `%.Nf`, `%x`, `%%`, `%Nd`, `%-Ns`.
 fn printf(fmt: &str, args: &[Value]) -> Result<String> {
     let mut out = String::new();
     let mut chars = fmt.chars().peekable();
@@ -1219,7 +1276,7 @@ fn printf(fmt: &str, args: &[Value]) -> Result<String> {
         };
         if width > 1 << 20 || prec.is_some_and(|p| p > 1 << 20) {
             return Err(Error::Sql(
-                "printf: largura ou precisão grande demais".into(),
+                "printf: largura ou precisÃƒÂ£o grande demais".into(),
             ));
         }
         let arg = next.next().unwrap_or(&Value::Null);
@@ -1232,7 +1289,7 @@ fn printf(fmt: &str, args: &[Value]) -> Result<String> {
             'X' => format!("{:X}", int("printf", arg).unwrap_or(0)),
             'f' | 'F' => format!("{:.*}", prec.unwrap_or(6), arg.as_f64().unwrap_or(0.0)),
             'e' | 'E' => format!("{:.*e}", prec.unwrap_or(6), arg.as_f64().unwrap_or(0.0)),
-            other => return Err(Error::Sql(format!("conversão %{other} desconhecida"))),
+            other => return Err(Error::Sql(format!("conversÃƒÂ£o %{other} desconhecida"))),
         };
         let body = match (conv, prec) {
             ('s', Some(p)) => body.chars().take(p).collect(),
@@ -1241,7 +1298,7 @@ fn printf(fmt: &str, args: &[Value]) -> Result<String> {
         if left {
             out.push_str(&format!("{body:<width$}"));
         } else if spec.starts_with('0') && conv != 's' {
-            // O sinal fica antes dos zeros: `%05d` de -42 é `-0042`.
+            // O sinal fica antes dos zeros: `%05d` de -42 ÃƒÂ© `-0042`.
             let (sign, digits) = match body.strip_prefix('-') {
                 Some(rest) => ("-", rest),
                 None => ("", body.as_str()),
@@ -1256,7 +1313,7 @@ fn printf(fmt: &str, args: &[Value]) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Data e hora (calendário proléptico gregoriano, UTC)
+// Data e hora (calendÃƒÂ¡rio prolÃƒÂ©ptico gregoriano, UTC)
 // ---------------------------------------------------------------------------
 
 pub fn now_secs() -> i64 {
@@ -1345,8 +1402,8 @@ fn fmt_time(secs: i64) -> String {
     format!("{:02}:{:02}:{:02}", c.hour, c.minute, c.second)
 }
 
-/// Aceita `YYYY-MM-DD`, `YYYY-MM-DD[T ]HH:MM[:SS[.fff]][Z|±HH:MM]`, `now`,
-/// e números (segundos Unix).
+/// Aceita `YYYY-MM-DD`, `YYYY-MM-DD[T ]HH:MM[:SS[.fff]][Z|Ã‚Â±HH:MM]`, `now`,
+/// e nÃƒÂºmeros (segundos Unix).
 pub fn parse_datetime(v: &Value) -> Option<i64> {
     match v {
         Value::Int(n) => Some(*n),
@@ -1425,7 +1482,7 @@ fn parse_datetime_text(s: &str) -> Option<i64> {
 fn apply_modifier(secs: i64, m: &str) -> Result<i64> {
     let m = m.trim().to_ascii_lowercase();
     let bad = || Error::Sql(format!("modificador de data desconhecido: {m}"));
-    // Fora desta faixa (~±31 milhões de anos) as contas abaixo podem estourar o i64.
+    // Fora desta faixa (~Ã‚Â±31 milhÃƒÂµes de anos) as contas abaixo podem estourar o i64.
     let overflow = || Error::Sql("data/hora fora do intervalo".into());
     if secs.unsigned_abs() > 1_000_000_000_000_000 {
         return Err(overflow());
@@ -1473,7 +1530,7 @@ fn apply_modifier(secs: i64, m: &str) -> Result<i64> {
             .round() as i64;
             let total = c.year * 12 + c.month as i64 - 1 + months;
             let (y, mo) = (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32);
-            // Dia além do fim do mês transborda para o mês seguinte (SQLite).
+            // Dia alÃƒÂ©m do fim do mÃƒÂªs transborda para o mÃƒÂªs seguinte (SQLite).
             days_from_civil(y, mo, 1) * 86400
                 + (c.day as i64 - 1) * 86400
                 + (c.hour as i64 * 3600 + c.minute as i64 * 60 + c.second as i64)
@@ -1546,7 +1603,7 @@ fn from_json(j: &Json) -> Value {
 
 /// Caminho `$`, `$.a.b`, `$.itens[2].nome`, `$[0]`.
 fn json_path<'j>(doc: &'j Json, path: &str) -> Result<Option<&'j Json>> {
-    let bad = || Error::Sql(format!("caminho JSON inválido: {path}"));
+    let bad = || Error::Sql(format!("caminho JSON invÃƒÂ¡lido: {path}"));
     let mut rest = path.strip_prefix('$').ok_or_else(bad)?;
     let mut node = doc;
     while !rest.is_empty() {
@@ -1582,9 +1639,9 @@ fn json_path<'j>(doc: &'j Json, path: &str) -> Result<Option<&'j Json>> {
     Ok(Some(node))
 }
 
-/// Conversão explícita de tipos (`CAST`).
+/// ConversÃƒÂ£o explÃƒÂ­cita de tipos (`CAST`).
 pub fn cast(v: Value, ty: Type) -> Result<Value> {
-    let bad = |v: &Value| Error::Sql(format!("CAST de {v} para {} inválido", ty.name()));
+    let bad = |v: &Value| Error::Sql(format!("CAST de {v} para {} invÃƒÂ¡lido", ty.name()));
     Ok(match (v, ty) {
         (Value::Null, _) => Value::Null,
         (v, Type::Text) => Value::Text(v.to_string()),
@@ -1651,7 +1708,7 @@ mod tests {
             fmt_datetime(apply_modifier(secs, "start of year").unwrap(), true),
             "2024-01-01 00:00:00"
         );
-        // Estouro vira erro, não pânico.
+        // Estouro vira erro, nÃƒÂ£o pÃƒÂ¢nico.
         assert!(apply_modifier(secs, "+1e300 days").is_err());
         assert!(apply_modifier(i64::MAX, "+1 second").is_err());
         let far = vec![Value::Int(i64::MAX), Value::Int(-1)];
@@ -1666,7 +1723,7 @@ mod tests {
     fn scalar_functions() {
         let c = |n: &str, v: Vec<Value>| call(n, v).unwrap();
         assert_eq!(
-            c("substr", vec![t("olá mundo"), Value::Int(-5)]),
+            c("substr", vec![t("olÃƒÂ¡ mundo"), Value::Int(-5)]),
             t("mundo")
         );
         assert_eq!(c("lpad", vec![t("7"), Value::Int(3), t("0")]), t("007"));
@@ -1712,6 +1769,8 @@ mod tests {
         assert_eq!(c("initcap", vec![t("olá MUNDO-x")]), t("Olá Mundo-X"));
         assert_eq!(c("sha256", vec![t("abc")]).to_string().len(), 64);
         assert_eq!(c("uuid", vec![]).to_string().len(), 36);
+        assert_eq!(c("uuid7", vec![]).to_string().len(), 36);
+        assert_eq!(c("ulid", vec![]).to_string().len(), 26);
         assert!(call("nada", vec![]).is_err());
         assert_eq!(c("upper", vec![Value::Null]), Value::Null);
     }
